@@ -1,7 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
-import { getDailyAgentConfig, getDashboardAgentConfig, getFeatureFlags } from "@/lib/admin-config";
+import {
+  getDailyAgentConfig,
+  getDashboardAgentConfig,
+  getFeatureFlags,
+  getUxConfig,
+} from "@/lib/admin-config";
 import { runAgent } from "@/lib/agent/loop";
 import { DAILY_TOOLS, DASHBOARD_TOOLS } from "@/lib/agent/tools-defs";
 import { db } from "@/lib/db";
@@ -15,7 +20,15 @@ async function getDashboardUser() {
   return await getSessionUser(token, "dashboard");
 }
 
-// GET /api/chat?action=history — recent chat history for the daily app
+// Default page size for history. Older messages are fetched page-by-page when
+// the user scrolls up (cursor pagination) — everything stays saved in the DB.
+const HISTORY_PAGE_SIZE = 100;
+
+// GET /api/chat?action=history — chat history for the daily app (paginated).
+//   ?limit=N   page size (default 100 — the UI shows the latest 100 and loads
+//              older ones on scroll-up)
+//   ?before=ISO  cursor: return messages strictly older than this timestamp
+//   Returns { messages: [...], hasMore: boolean }
 export async function GET(req: NextRequest) {
   const url = new URL(req.url);
   const action = url.searchParams.get("action");
@@ -25,19 +38,37 @@ export async function GET(req: NextRequest) {
     if (!user || user.id === "admin") {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
-    const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "60", 10) || 60, 200);
+    const limit = Math.min(parseInt(url.searchParams.get("limit") ?? String(HISTORY_PAGE_SIZE), 10) || HISTORY_PAGE_SIZE, 200);
+    const before = url.searchParams.get("before");
+
+    const where: any = { userId: user.id, role: { in: ["user", "assistant"] } };
+    if (before) {
+      const d = new Date(before);
+      if (!isNaN(d.getTime())) where.createdAt = { lt: d };
+    }
+
     const rows = await db.chatMessage.findMany({
-      where: { userId: user.id, role: { in: ["user", "assistant"] } },
+      where,
       orderBy: { createdAt: "desc" },
-      take: limit,
+      take: limit + 1, // +1 to detect whether an older page exists
     });
-    rows.reverse();
+
+    const hasMore = rows.length > limit;
+    const page = rows.slice(0, limit);
+    page.reverse();
+
     return NextResponse.json({
-      messages: rows.map((r) => ({
-        role: r.role as "user" | "assistant",
-        content: r.content,
-        ts: r.createdAt.toISOString(),
-      })),
+      messages: page.map((r) => {
+        let meta: any = {};
+        try { meta = JSON.parse(r.metadata || "{}"); } catch { meta = {}; }
+        return {
+          role: r.role as "user" | "assistant",
+          content: r.content,
+          ts: r.createdAt.toISOString(),
+          chartSpec: meta.chartSpec ?? null,
+        };
+      }),
+      hasMore,
     });
   }
 
@@ -45,6 +76,8 @@ export async function GET(req: NextRequest) {
 }
 
 // POST /api/chat?action=daily|dashboard
+// The DAILY agent now has the full analytical toolkit (query/aggregate/charts/
+// reminders/exports) — the dashboard deep-dive powers live in the '/' chat too.
 export async function POST(req: NextRequest) {
   const url = new URL(req.url);
   const action = url.searchParams.get("action") ?? "daily";
@@ -88,7 +121,19 @@ export async function POST(req: NextRequest) {
   }
 
   try {
+    const startedAt = Date.now();
     const result = await runAgent({ userId, userMessage: message, agentType, config, tools });
+
+    // Optional admin-configurable minimum reply delay (uxConfig.replyDelayMs).
+    // Keeps the typing indicator visible long enough on very fast models.
+    const ux = await getUxConfig();
+    const delayMs = Math.max(0, Math.min(5000, Number(ux.replyDelayMs ?? 0)));
+    if (delayMs > 0) {
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < delayMs) {
+        await new Promise((r) => setTimeout(r, delayMs - elapsed));
+      }
+    }
 
     // If autoAppendTotals is on AND this is daily chat, append today + month totals
     let finalText = result.assistantText;
@@ -102,6 +147,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       reply: finalText,
+      chartSpec: result.chartSpec,
       toolCalls: result.toolCalls,
     });
   } catch (e: any) {

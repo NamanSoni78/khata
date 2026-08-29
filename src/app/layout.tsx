@@ -15,17 +15,57 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Khata — daily money tracker",
-  description: "Log your daily transactions by chat or voice. Private, minimal, made for everyday use.",
+  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL ?? "https://khata.namansoni.in"),
+  title: {
+    default: "Khata — daily money tracker",
+    template: "%s · Khata",
+  },
+  description:
+    "Log your daily transactions by chat or voice — in English, Hindi or Hinglish. Private, minimal, made for everyday use. Install it as an app and track expenses, accounts and investments effortlessly.",
+  applicationName: "Khata",
+  keywords: [
+    "money tracker", "expense tracker", "daily expenses", "personal finance",
+    "hinglish", "voice expense logging", "khata", "digital ledger",
+  ],
   manifest: "/manifest.json",
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    type: "website",
+    url: "/",
+    siteName: "Khata",
+    title: "Khata — daily money tracker",
+    description:
+      "Chat or speak your transactions in any mix of English or Hindi. Private, minimal, made for everyday use.",
+  },
+  twitter: {
+    card: "summary",
+    title: "Khata — daily money tracker",
+    description: "Chat or speak your transactions. Private, minimal, everyday.",
+  },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: {
+      index: true,
+      follow: true,
+      "max-snippet": -1,
+      "max-image-preview": "large",
+    },
+  },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
     title: "Khata",
   },
   icons: {
-    icon: "/icon-192.svg",
-    apple: "/icon-192.svg",
+    icon: [
+      { url: "/icon-192.svg", type: "image/svg+xml" },
+      { url: "/icon-192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon-512.png", sizes: "512x512", type: "image/png" },
+    ],
+    apple: [{ url: "/icon-192.png", sizes: "192x192" }],
   },
 };
 

@@ -8,11 +8,12 @@ import {
 import {
   TrendingUp, TrendingDown, Wallet, Download, LogOut, ArrowLeft, Users,
   RefreshCw, Bell, Plus, Trash2, FileText, Moon, Sun, Settings as SettingsIcon,
-  Loader2,
+  Loader2, Upload, Copy, CalendarDays,
 } from "lucide-react";
 import { MultiPeriodChart } from "@/components/dashboard/MultiPeriodChart";
 import DeepDiveChat from "@/components/dashboard/DeepDiveChat";
 import MindmapEditor from "@/components/mindmap/MindmapEditor";
+import ImportDialog from "@/components/dashboard/ImportDialog";
 
 const PIE_COLORS = [
   "#059669", "#d97706", "#e11d48", "#8b5cf6", "#0891b2", "#65a30d", "#db2777",
@@ -47,6 +48,8 @@ export default function DashboardApp({ username }: { username: string }) {
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [exportingPdf, setExportingPdf] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [copyingPrompt, setCopyingPrompt] = useState(false);
 
   // Theme toggle — icon visibility handled via CSS dark: variants (no state → no hydration issues)
   const toggleTheme = () => {
@@ -104,6 +107,20 @@ export default function DashboardApp({ username }: { username: string }) {
     if (format === "pdf") setExportingPdf(true);
     window.open(`/api/dashboard/export?${params.toString()}`, "_blank");
     setTimeout(() => setExportingPdf(false), 1500);
+  };
+
+  const copySetupPrompt = async () => {
+    setCopyingPrompt(true);
+    try {
+      const res = await fetch("/addingaccountsprompt.md");
+      const text = await res.text();
+      await navigator.clipboard.writeText(text);
+      toast.success("Setup prompt copied — paste it into any AI chatbot");
+    } catch {
+      toast.error("Couldn't copy — open /addingaccountsprompt.md manually");
+    } finally {
+      setCopyingPrompt(false);
+    }
   };
 
   const logout = async () => {
@@ -329,8 +346,26 @@ export default function DashboardApp({ username }: { username: string }) {
         {/* Accounts + Contacts */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="bg-card border border-border rounded-2xl anim-fade-up">
-            <div className="px-5 pt-5 pb-2">
+            <div className="px-5 pt-5 pb-2 flex items-start justify-between gap-2">
               <h2 className="font-semibold text-sm text-foreground">Accounts ({stats.accounts.length})</h2>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  onClick={copySetupPrompt}
+                  disabled={copyingPrompt}
+                  className="press h-7 px-2.5 rounded-lg border border-input text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors flex items-center gap-1 disabled:opacity-60"
+                  title="Copy addingaccountsprompt.md — paste it into any AI chatbot to generate import data"
+                >
+                  {copyingPrompt ? <Loader2 className="w-3 h-3 animate-spin" /> : <Copy className="w-3 h-3" />}
+                  Copy AI prompt
+                </button>
+                <button
+                  onClick={() => setShowImport(true)}
+                  className="press h-7 px-2.5 rounded-lg bg-primary text-primary-foreground text-[11px] font-medium flex items-center gap-1"
+                  title="Import accounts, contacts and categories from a markdown/JSON block"
+                >
+                  <Upload className="w-3 h-3" /> Import data
+                </button>
+              </div>
             </div>
             <div className="px-5 pb-4">
               <div className="divide-y divide-border">
@@ -437,6 +472,14 @@ export default function DashboardApp({ username }: { username: string }) {
           <NotificationsCard />
         </div>
 
+        {/* Import dialog */}
+        {showImport && (
+          <ImportDialog
+            onClose={() => setShowImport(false)}
+            onDone={() => load(period)}
+          />
+        )}
+
         {/* Recent transactions */}
         <div className="bg-card border border-border rounded-2xl anim-fade-up">
           <div className="px-5 pt-5 pb-3">
@@ -532,10 +575,25 @@ function SummaryCard({
 }
 
 function NotificationsCard() {
-  const [notifs, setNotifs] = useState<Array<{ id: string; schedule: string; message: string; isActive: boolean; lastFiredAt: string | null }>>([]);
-  const [newSchedule, setNewSchedule] = useState("0 20 * * *");
-  const [newMessage, setNewMessage] = useState("Time to log your transactions!");
+  // Calendar-style reminder builder — NO cron syntax exposed anywhere.
+  interface Notif {
+    id: string;
+    description: string;
+    message: string;
+    isActive: boolean;
+    nextRunAt: string | null;
+    lastFiredAt: string | null;
+  }
+  const [notifs, setNotifs] = useState<Notif[]>([]);
+  const [repeat, setRepeat] = useState<"once" | "daily" | "weekly" | "monthly">("daily");
+  const [time, setTime] = useState("20:00");
+  const [date, setDate] = useState("");
+  const [days, setDays] = useState<number[]>([1]);
+  const [dayOfMonth, setDayOfMonth] = useState(1);
+  const [message, setMessage] = useState("Time to log your transactions!");
   const [loading, setLoading] = useState(false);
+
+  const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
 
   const load = async () => {
     const res = await fetch("/api/dashboard/notifications");
@@ -562,16 +620,22 @@ function NotificationsCard() {
       const res = await fetch("/api/dashboard/notifications", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ schedule: newSchedule, message: newMessage }),
+        body: JSON.stringify({
+          type: repeat,
+          time,
+          date: repeat === "once" ? date : undefined,
+          days: repeat === "weekly" ? days : undefined,
+          day_of_month: repeat === "monthly" ? dayOfMonth : undefined,
+          message,
+        }),
       });
+      const j = await res.json();
       if (res.ok) {
-        toast.success("Reminder scheduled");
-        setNewSchedule("0 20 * * *");
-        setNewMessage("Time to log your transactions!");
+        toast.success(`Reminder scheduled — ${j.description ?? ""}`);
+        setMessage("Time to log your transactions!");
         load();
       } else {
-        const e = await res.json();
-        toast.error(e.error ?? "Couldn't schedule");
+        toast.error(j.error ?? "Couldn't schedule");
       }
     } finally {
       setLoading(false);
@@ -593,6 +657,9 @@ function NotificationsCard() {
     load();
   };
 
+  const insertPlaceholder = (p: string) =>
+    setMessage((m) => (m.includes(p) ? m : `${m}${m.endsWith(" ") || m.length === 0 ? "" : " "}${p}`));
+
   return (
     <div className="bg-card border border-border rounded-2xl">
       <div className="px-5 pt-5 pb-3">
@@ -600,49 +667,128 @@ function NotificationsCard() {
           <Bell className="w-4 h-4 text-primary" /> Reminders
         </h2>
         <p className="text-xs text-muted-foreground mt-1.5">
-          Schedule nudges to log transactions or daily/weekly summaries. Use{" "}
-          <code className="bg-muted px-1 py-0.5 rounded text-[10px]">{`{today_income}`}</code>,{" "}
-          <code className="bg-muted px-1 py-0.5 rounded text-[10px]">{`{today_expense}`}</code>,{" "}
-          <code className="bg-muted px-1 py-0.5 rounded text-[10px]">{`{month_income}`}</code>,{" "}
-          <code className="bg-muted px-1 py-0.5 rounded text-[10px]">{`{month_expense}`}</code>{" "}
-          in the message to include your totals.
+          Push notifications at times you choose — daily summaries, logging nudges, one-offs.
         </p>
       </div>
       <div className="px-5 pb-5 space-y-3">
-        <div className="space-y-2 p-4 bg-muted/50 border border-border rounded-xl">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            <div>
-              <label className="text-xs text-muted-foreground block mb-1">Schedule</label>
-              <input
-                value={newSchedule}
-                onChange={(e) => setNewSchedule(e.target.value)}
-                placeholder="0 20 * * * (daily 8pm)"
-                className="w-full h-9 rounded-lg border border-input bg-background px-2.5 font-mono text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-              />
+        <div className="space-y-3 p-4 bg-muted/50 border border-border rounded-xl">
+          {/* Repeat type */}
+          <div className="flex items-center gap-1.5">
+            <CalendarDays className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+            <div className="flex flex-wrap gap-1">
+              {(["once", "daily", "weekly", "monthly"] as const).map((r) => (
+                <button
+                  key={r}
+                  onClick={() => setRepeat(r)}
+                  className={`press text-xs px-3 h-8 rounded-lg font-medium border transition-colors ${
+                    repeat === r
+                      ? "border-primary bg-accent text-accent-foreground"
+                      : "border-transparent text-muted-foreground hover:text-foreground hover:bg-accent/40"
+                  }`}
+                >
+                  {r === "once" ? "Once" : r[0].toUpperCase() + r.slice(1)}
+                </button>
+              ))
+              }
             </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {/* Date (once) */}
+            {repeat === "once" && (
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Date</label>
+                <input
+                  type="date"
+                  value={date}
+                  onChange={(e) => setDate(e.target.value)}
+                  className="w-full h-9 rounded-lg border border-input bg-background px-2.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+                />
+              </div>
+            )}
+            {/* Time */}
             <div>
-              <label className="text-xs text-muted-foreground block mb-1">Message</label>
+              <label className="text-xs text-muted-foreground block mb-1">Time</label>
               <input
-                value={newMessage}
-                onChange={(e) => setNewMessage(e.target.value)}
-                placeholder="Today: {today_income} in / {today_expense} out"
+                type="time"
+                value={time}
+                onChange={(e) => setTime(e.target.value)}
                 className="w-full h-9 rounded-lg border border-input bg-background px-2.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
               />
             </div>
+            {/* Day of month (monthly) */}
+            {repeat === "monthly" && (
+              <div>
+                <label className="text-xs text-muted-foreground block mb-1">Day of month</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={31}
+                  value={dayOfMonth}
+                  onChange={(e) => setDayOfMonth(Math.max(1, Math.min(31, Number(e.target.value) || 1)))}
+                  className="w-full h-9 rounded-lg border border-input bg-background px-2.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+                />
+              </div>
+            )}
           </div>
-          <div className="flex items-center justify-between flex-wrap gap-2">
-            <p className="text-[11px] text-muted-foreground/80">
-              Cron e.g. <code className="bg-muted px-1 rounded">0 20 * * *</code> daily 8pm · <code className="bg-muted px-1 rounded">0 9 * * 1</code> Mondays 9am · or a one-time <code className="bg-muted px-1 rounded">2026-09-01T20:00:00</code>
-            </p>
+
+          {/* Weekday chips (weekly) */}
+          {repeat === "weekly" && (
+            <div>
+              <label className="text-xs text-muted-foreground block mb-1">Repeat on</label>
+              <div className="flex gap-1">
+                {DAY_LABELS.map((d, i) => (
+                  <button
+                    key={i}
+                    onClick={() =>
+                      setDays((ds) => (ds.includes(i) ? ds.filter((x) => x !== i) : [...ds, i].sort()))
+                    }
+                    className={`press w-8 h-8 rounded-full text-xs font-medium border transition-colors ${
+                      days.includes(i)
+                        ? "border-primary bg-accent text-accent-foreground"
+                        : "border-input text-muted-foreground hover:border-ring/50"
+                    }`}
+                  >
+                    {d}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Message + placeholders */}
+          <div>
+            <label className="text-xs text-muted-foreground block mb-1">Message</label>
+            <input
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              placeholder="Today: {today_income} in / {today_expense} out"
+              className="w-full h-9 rounded-lg border border-input bg-background px-2.5 text-xs text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+            />
+            <div className="flex flex-wrap gap-1 mt-1.5">
+              {["{today_income}", "{today_expense}", "{month_income}", "{month_expense}"].map((p) => (
+                <button
+                  key={p}
+                  onClick={() => insertPlaceholder(p)}
+                  className="press text-[10px] font-mono px-1.5 py-0.5 rounded border border-border text-muted-foreground hover:text-foreground hover:bg-accent/40 transition-colors"
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex justify-end">
             <button
               onClick={create}
-              disabled={loading}
+              disabled={loading || !message.trim() || (repeat === "once" && !date) || (repeat === "weekly" && days.length === 0)}
               className="press h-8 px-3 rounded-lg bg-primary text-primary-foreground text-xs font-medium flex items-center gap-1.5 disabled:opacity-60"
             >
               {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />} Schedule
             </button>
           </div>
         </div>
+
         <div className="space-y-2">
           {notifs.length === 0 ? (
             <p className="text-sm text-muted-foreground text-center py-4">No reminders yet.</p>
@@ -650,10 +796,13 @@ function NotificationsCard() {
             notifs.map((n) => (
               <div key={n.id} className="flex items-start justify-between p-3.5 bg-muted/50 border border-border rounded-xl">
                 <div className="flex-1 min-w-0">
-                  <p className="text-xs font-mono text-muted-foreground">{n.schedule}</p>
+                  <p className="text-xs font-medium text-primary">{n.description}</p>
                   <p className="text-sm text-foreground truncate mt-0.5">{n.message}</p>
                   <p className="text-[11px] text-muted-foreground/70 mt-1">
-                    {n.isActive ? "Active" : "Paused"} · last sent {n.lastFiredAt ? new Date(n.lastFiredAt).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "never"}
+                    {n.isActive
+                      ? `next ${n.nextRunAt ? new Date(n.nextRunAt).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}`
+                      : "Paused"}
+                    {n.lastFiredAt ? ` · last sent ${new Date(n.lastFiredAt).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}` : ""}
                   </p>
                 </div>
                 <div className="flex items-center gap-1 ml-2 shrink-0">
@@ -675,7 +824,7 @@ function NotificationsCard() {
           )}
         </div>
         <p className="text-[11px] text-muted-foreground/70 pt-1">
-          Reminders arrive as push notifications on devices where you&apos;ve enabled them (daily app → Settings).
+          Reminders arrive as push notifications on devices where you&apos;ve enabled them (daily app → Settings). You can also ask the assistant — e.g. &quot;remind me at 9:10pm daily with today&apos;s totals&quot;.
         </p>
       </div>
     </div>

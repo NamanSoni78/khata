@@ -38,7 +38,8 @@ interface FeatureFlags {
   autoAppendTotals: boolean;
   defaultLanguage: "english" | "hinglish" | "hindi";
 }
-interface SchemaMode { mode: "llm" | "rag"; lastNTxns: number; refreshEveryCall: boolean; }
+interface SchemaMode { mode: "llm" | "rag"; lastNTxns: number; refreshEveryCall: boolean; chatHistoryLimit?: number; }
+interface UxConfig { replyDelayMs?: number; }
 interface GlossaryEntry { term: string; desc: string; }
 
 export default function AdminPanel() {
@@ -103,6 +104,7 @@ export default function AdminPanel() {
   const ocr = (all["agent.ocr"] ?? {}) as OcrConfig;
   const flags = (all["featureFlags"] ?? {}) as FeatureFlags;
   const schemaMode = (all["schemaMode"] ?? {}) as SchemaMode;
+  const uxConfig = (all["uxConfig"] ?? {}) as UxConfig;
   const glossary = (all["glossary"] ?? []) as GlossaryEntry[];
   const timeTemplate = (all["timeTemplate"] ?? "") as string;
 
@@ -239,9 +241,38 @@ export default function AdminPanel() {
                     <option value="hindi">Hindi</option>
                   </select>
                 </div>
-                <Button onClick={() => saveKey("featureFlags", all["featureFlags"])} className="mt-2">
-                  <Save className="w-4 h-4 mr-1" /> Save flags
-                </Button>
+                <div className="flex items-center justify-between pt-4 border-t border-border">
+                  <div>
+                    <Label>Minimum reply delay (ms)</Label>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Optional artificial delay before a chat reply is returned — keeps the typing indicator visible on
+                      very fast models. 0 = disabled (replies stream as soon as the model answers). There is no other
+                      built-in delay anywhere in the chat pipeline.
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={5000}
+                    step={100}
+                    className="w-24"
+                    value={uxConfig.replyDelayMs ?? 0}
+                    onChange={(e) =>
+                      setAll({
+                        ...all,
+                        uxConfig: { ...uxConfig, replyDelayMs: Math.max(0, Math.min(5000, Number(e.target.value) || 0)) },
+                      })
+                    }
+                  />
+                </div>
+                <div className="flex gap-2 mt-2">
+                  <Button onClick={() => saveKey("featureFlags", all["featureFlags"])}>
+                    <Save className="w-4 h-4 mr-1" /> Save flags
+                  </Button>
+                  <Button variant="outline" onClick={() => saveKey("uxConfig", all["uxConfig"])}>
+                    <Save className="w-4 h-4 mr-1" /> Save UX config
+                  </Button>
+                </div>
               </CardContent>
             </Card>
           </TabsContent>
@@ -422,6 +453,31 @@ export default function AdminPanel() {
                     value={schemaMode.lastNTxns}
                     onChange={(e) =>
                       setAll({ ...all, schemaMode: { ...schemaMode, lastNTxns: Number(e.target.value) } })
+                    }
+                  />
+                </div>
+                <div className="flex items-center justify-between pt-2 border-t border-border">
+                  <div>
+                    <Label>Chat history window (messages)</Label>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Recent chat messages fed to the LLM each call. Older messages are always reachable by the agent via
+                      the search_chat_history tool — so context is effectively infinite either way.
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={4}
+                    max={80}
+                    className="w-24"
+                    value={schemaMode.chatHistoryLimit ?? 24}
+                    onChange={(e) =>
+                      setAll({
+                        ...all,
+                        schemaMode: {
+                          ...schemaMode,
+                          chatHistoryLimit: Math.max(4, Math.min(80, Number(e.target.value) || 24)),
+                        },
+                      })
                     }
                   />
                 </div>

@@ -80,7 +80,7 @@ async function generatePdf(
   });
 
   // === Title ===
-  doc.fontSize(20).text("Finance Tracker — Transactions Report", { align: "center" });
+  doc.fontSize(20).text("Khata — Transactions Report", { align: "center" });
   doc.moveDown(0.5);
   doc.fontSize(10).fillColor("#666666").text(
     `Generated ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}`,

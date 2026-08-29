@@ -1,9 +1,9 @@
-// Finance Tracker Service Worker
+// Khata PWA Service Worker — offline shell + push + background sync
 // - Caches app shell for offline fallback (cache-first on / route)
 // - Listens for push events (Phase 3 will activate the displayNotification)
 // - Listens for "sync" event (Phase 3 will flush queued messages via Background Sync API)
 
-const CACHE_NAME = "khata-v2";
+const CACHE_NAME = "khata-v3";
 const APP_SHELL = [
   "/",
   "/manifest.json",
@@ -76,9 +76,9 @@ self.addEventListener("push", (e) => {
   try {
     data = e.data ? e.data.json() : {};
   } catch {
-    data = { title: "Finance Tracker", body: e.data?.text() ?? "" };
+    data = { title: "Khata", body: e.data?.text() ?? "" };
   }
-  const title = data.title ?? "Finance Tracker";
+  const title = data.title ?? "Khata";
   const options = {
     body: data.body ?? data.message ?? "",
     icon: "/icon-192.svg",
@@ -87,7 +87,7 @@ self.addEventListener("push", (e) => {
     vibrate: [200, 80, 200],
     requireInteraction: false,
     actions: [{ action: "open", title: "Open" }],
-    tag: data.tag ?? "fintrack-notif",
+    tag: data.tag ?? "khata-notif",
     renotify: !!data.tag,
   };
   e.waitUntil(self.registration.showNotification(title, options));
@@ -121,7 +121,7 @@ self.addEventListener("message", (e) => {
 // ============================================================
 
 self.addEventListener("sync", (e) => {
-  if (e.tag === "fintrack-queue") {
+  if (e.tag === "khata-queue") {
     e.waitUntil(
       self.clients.matchAll().then((clientsArr) =>
         clientsArr.forEach((c) => c.postMessage({ type: "SYNC_TRIGGER" }))

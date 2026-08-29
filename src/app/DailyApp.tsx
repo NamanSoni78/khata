@@ -9,8 +9,11 @@ import {
 import {
   Mic, MicOff, Send, LogOut, Loader2, Lock, KeyRound, Paperclip,
   Fingerprint, Settings as SettingsIcon, Trash2, Plus, Moon, Sun,
-  BarChart3, WifiOff, CheckCheck, Clock3, ChevronDown, X,
+  BarChart3, WifiOff, CheckCheck, Clock3, X, Download, Languages,
+  ImageIcon, ChevronUp, Loader,
 } from "lucide-react";
+import Markdown from "@/components/chat/Markdown";
+import { InlineChartReveal, type ChartSpec } from "@/components/charts/InlineChart";
 
 type Stage = "login" | "mpin-setup" | "unlock" | "chat";
 
@@ -27,6 +30,7 @@ interface ChatMsg {
   ts: string;
   pending?: boolean;
   queued?: boolean;
+  chartSpec?: ChartSpec | null;
 }
 
 interface Passkey {
@@ -37,6 +41,17 @@ interface Passkey {
 }
 
 const QUEUE_KEY = "khata-offline-queue";
+const VOICE_LANG_KEY = "khata-voice-lang";
+
+/** Chat wallpapers — subtle, non-distracting gradients (applied to the chat area). */
+const WALLPAPERS: Record<string, { label: string; light: string; dark: string }> = {
+  none: { label: "None", light: "", dark: "" },
+  paper: { label: "Paper", light: "bg-[#faf9f4]", dark: "dark:bg-[#26241f]" },
+  mint: { label: "Mint", light: "bg-[#f0f7f2]", dark: "dark:bg-[#1e2621]" },
+  peach: { label: "Peach", light: "bg-[#fbf3ec]", dark: "dark:bg-[#282119]" },
+  sky: { label: "Sky", light: "bg-[#eef4fa]", dark: "dark:bg-[#1d2430]" },
+  lavender: { label: "Lavender", light: "bg-[#f4f1fa]", dark: "dark:bg-[#241f2e]" },
+};
 
 function loadQueue(): string[] {
   try {
@@ -75,23 +90,41 @@ export default function DailyApp({ initialStage, username }: Props) {
   const [pushEnabled, setPushEnabled] = useState(false);
   const [pushSubscribed, setPushSubscribed] = useState(false);
   const [pushLoading, setPushLoading] = useState(false);
+  const [canInstall, setCanInstall] = useState(false);
+  const installPromptRef = useRef<any>(null);
+  const [voiceLang, setVoiceLang] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem(VOICE_LANG_KEY);
+      return saved ?? "en-IN";
+    } catch {
+      return "en-IN";
+    }
+  });
+  const [wallpaper, setWallpaper] = useState<string>("none");
+  const [autoFingerprint, setAutoFingerprint] = useState<boolean>(true);
 
   // Chat
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [listening, setListening] = useState(false);
-  const [online, setOnline] = useState(true);
+  const [online, setOnline] = useState(() => (typeof navigator !== "undefined" ? navigator.onLine : true));
   const [chatUser, setChatUser] = useState(username);
   const [uploadingStatement, setUploadingStatement] = useState(false);
   const [pdfUploadEnabled, setPdfUploadEnabled] = useState(true);
   const [ocrEnabled, setOcrEnabled] = useState(false);
   const [queuedCount, setQueuedCount] = useState(0);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [hasMoreHistory, setHasMoreHistory] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollMainRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const autoWebauthnTriedRef = useRef(false);
+  const holdTimerRef = useRef<number | null>(null);
+  const heldRef = useRef(false);
 
   // ===== Theme (icon visibility handled purely via CSS dark: variants) =====
   const toggleTheme = () => {
@@ -108,12 +141,40 @@ export default function DailyApp({ initialStage, username }: Props) {
     const goOffline = () => setOnline(false);
     window.addEventListener("online", goOnline);
     window.addEventListener("offline", goOffline);
-    setOnline(navigator.onLine);
     return () => {
       window.removeEventListener("online", goOnline);
       window.removeEventListener("offline", goOffline);
     };
   }, []);
+
+  // ===== PWA install prompt (Chrome/Edge fire beforeinstallprompt when installable) =====
+  useEffect(() => {
+    const handler = (e: Event) => {
+      e.preventDefault(); // stop Chrome's default mini-infobar — we show our own button
+      installPromptRef.current = e;
+      setCanInstall(true);
+    };
+    window.addEventListener("beforeinstallprompt", handler);
+    const installed = () => {
+      installPromptRef.current = null;
+      setCanInstall(false);
+    };
+    window.addEventListener("appinstalled", installed);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", handler);
+      window.removeEventListener("appinstalled", installed);
+    };
+  }, []);
+
+  const promptInstall = async () => {
+    const ev = installPromptRef.current;
+    if (!ev) return;
+    ev.prompt();
+    const { outcome } = await ev.userChoice.catch(() => ({ outcome: "dismissed" }));
+    if (outcome === "accepted") toast.success("Installing Khata…");
+    installPromptRef.current = null;
+    setCanInstall(false);
+  };
 
   // ===== Load profile + chat history when entering chat =====
   useEffect(() => {
@@ -129,20 +190,28 @@ export default function DailyApp({ initialStage, username }: Props) {
         setPdfUploadEnabled(j.flags.pdfUpload !== false);
         setOcrEnabled(j.flags.ocr === true);
       }
-      // Load persisted chat history so the conversation survives reloads
+      if (j.prefs) {
+        if (typeof j.prefs.wallpaper === "string" && WALLPAPERS[j.prefs.wallpaper]) {
+          setWallpaper(j.prefs.wallpaper);
+        }
+        if (typeof j.prefs.autoFingerprint === "boolean") setAutoFingerprint(j.prefs.autoFingerprint);
+      }
+      // Load persisted chat history (latest page — older pages load on scroll-up)
       try {
-        const hres = await fetch("/api/chat?action=history&limit=60");
+        const hres = await fetch("/api/chat?action=history&limit=100");
         if (hres.ok && active) {
           const hj = await hres.json();
-          if (Array.isArray(hj.messages) && hj.messages.length > 0) {
+          if (Array.isArray(hj.messages)) {
             setMessages(
               hj.messages.map((m: any) => ({
                 id: `h_${m.ts}_${Math.random().toString(36).slice(2, 6)}`,
                 role: m.role,
                 content: m.content,
                 ts: m.ts,
+                chartSpec: m.chartSpec ?? null,
               }))
             );
+            setHasMoreHistory(!!hj.hasMore);
           }
         }
       } catch { /* history is best-effort */ }
@@ -150,6 +219,74 @@ export default function DailyApp({ initialStage, username }: Props) {
     })();
     return () => { active = false; };
   }, [stage]);
+
+  // ===== Unlock screen: load webauthn availability + AUTO fingerprint prompt =====
+  // The user asked: arriving + touching the sensor should log them in — so we
+  // trigger the platform authenticator automatically (once). The OS shows the
+  // biometric prompt; the user just touches the sensor. MPIN stays as fallback.
+  useEffect(() => {
+    if (stage !== "unlock") return;
+    let active = true;
+    (async () => {
+      try {
+        const res = await fetch("/api/auth/me");
+        if (!res.ok) return;
+        const j = await res.json();
+        if (!active) return;
+        setHasWebauthn(!!j.hasWebauthn);
+        if (j.prefs && typeof j.prefs.autoFingerprint === "boolean") {
+          setAutoFingerprint(j.prefs.autoFingerprint);
+        }
+        if (j.hasWebauthn && j.prefs?.autoFingerprint !== false && !autoWebauthnTriedRef.current) {
+          autoWebauthnTriedRef.current = true;
+          setTimeout(() => { if (active) unlockWithWebauthn(true); }, 350);
+        }
+      } catch { /* offline — MPIN still works */ }
+    })();
+    return () => { active = false; };
+  }, [stage]);
+
+  // ===== Scroll-up pagination: load older messages when the user reaches the top =====
+  const loadOlderMessages = useCallback(async () => {
+    if (loadingOlder || !hasMoreHistory || messages.length === 0) return;
+    const oldest = messages.find((m) => m.id.startsWith("h_")) ?? messages[0];
+    if (!oldest) return;
+    setLoadingOlder(true);
+    const main = scrollMainRef.current;
+    const prevHeight = main?.scrollHeight ?? 0;
+    try {
+      const res = await fetch(`/api/chat?action=history&limit=100&before=${encodeURIComponent(oldest.ts)}`);
+      if (res.ok) {
+        const j = await res.json();
+        if (Array.isArray(j.messages) && j.messages.length > 0) {
+          setMessages((m) => [
+            ...j.messages.map((mm: any) => ({
+              id: `h_${mm.ts}_${Math.random().toString(36).slice(2, 6)}`,
+              role: mm.role,
+              content: mm.content,
+              ts: mm.ts,
+              chartSpec: mm.chartSpec ?? null,
+            })),
+            ...m,
+          ]);
+          setHasMoreHistory(!!j.hasMore);
+          // Keep the scroll position where the user was (no jump)
+          requestAnimationFrame(() => {
+            if (main) main.scrollTop = main.scrollHeight - prevHeight;
+          });
+        } else {
+          setHasMoreHistory(false);
+        }
+      }
+    } catch { /* best-effort */ } finally {
+      setLoadingOlder(false);
+    }
+  }, [loadingOlder, hasMoreHistory, messages]);
+
+  const onMainScroll = useCallback(() => {
+    const main = scrollMainRef.current;
+    if (main && main.scrollTop < 80) loadOlderMessages();
+  }, [loadOlderMessages]);
 
   // ===== Offline queue: flush when back online =====
   const flushQueue = useCallback(async () => {
@@ -174,7 +311,7 @@ export default function DailyApp({ initialStage, username }: Props) {
         setMessages((m) =>
           m.map((mm, i) =>
             i === m.length - 1
-              ? { ...mm, content: res.ok ? j.reply : (j.error ?? "Couldn't send — will try again."), pending: false }
+              ? { ...mm, content: res.ok ? j.reply : (j.error ?? "Couldn't send — will try again."), pending: false, chartSpec: res.ok ? (j.chartSpec ?? null) : null }
               : i === m.length - 2
                 ? { ...mm, queued: false }
                 : mm
@@ -198,17 +335,24 @@ export default function DailyApp({ initialStage, username }: Props) {
     if (stage === "chat" && online && historyLoaded) {
       const queue = loadQueue();
       if (queue.length > 0) {
-        setQueuedCount(queue.length);
-        setSending(true);
-        flushQueue();
+        // Defer state updates out of the effect body (avoids cascading renders)
+        const t = window.setTimeout(() => {
+          setQueuedCount(queue.length);
+          setSending(true);
+          flushQueue();
+        }, 0);
+        return () => window.clearTimeout(t);
       }
     }
   }, [stage, online, historyLoaded, flushQueue]);
 
-  // ===== Auto-scroll =====
+  // ===== Auto-scroll to bottom on NEW messages (not when loading older) =====
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    const last = messages[messages.length - 1];
+    if (last && !loadingOlder) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages, loadingOlder]);
 
   // ===== Auto-resize textarea =====
   useEffect(() => {
@@ -297,7 +441,9 @@ export default function DailyApp({ initialStage, username }: Props) {
     }
   };
 
-  const unlockWithWebauthn = async () => {
+  // Hoisted function declaration — the auto-fingerprint effect above references
+  // it before this line runs, which is legal for `function` declarations.
+  async function unlockWithWebauthn(auto = false) {
     setWebauthnUnlockLoading(true);
     try {
       const beginRes = await fetch("/api/auth/webauthn/login/begin", {
@@ -307,7 +453,7 @@ export default function DailyApp({ initialStage, username }: Props) {
       });
       const beginOpts = await beginRes.json();
       if (!beginRes.ok) {
-        toast.error(beginOpts.error ?? "Couldn't start fingerprint unlock");
+        if (!auto) toast.error(beginOpts.error ?? "Couldn't start fingerprint unlock");
         return;
       }
       const assertion = await startAuthentication({ optionsJSON: beginOpts });
@@ -318,28 +464,39 @@ export default function DailyApp({ initialStage, username }: Props) {
       });
       const finishJ = await finishRes.json();
       if (!finishRes.ok) {
-        toast.error(finishJ.error ?? "Fingerprint verification failed");
+        if (!auto) toast.error(finishJ.error ?? "Fingerprint verification failed");
         return;
       }
       toast.success(`Welcome back, ${finishJ.username}`);
       setStage("chat");
     } catch (e: any) {
-      if (e?.name !== "NotAllowedError") {
+      // Auto attempts fail silently (user may prefer MPIN); manual ones show errors
+      if (!auto && e?.name !== "NotAllowedError") {
         toast.error(e?.message ?? "Fingerprint unlock failed");
       }
     } finally {
       setWebauthnUnlockLoading(false);
     }
-  };
+  }
 
   // ============================================================
-  //  PASSKEYS + NOTIFICATIONS
+  //  PASSKEYS + NOTIFICATIONS + PREFS
   // ============================================================
   const loadPasskeys = async () => {
     const res = await fetch("/api/auth/me");
     if (!res.ok) return;
     const j = await res.json();
     if (j.passkeys) setPasskeys(j.passkeys);
+  };
+
+  const savePrefs = async (patch: Record<string, unknown>) => {
+    try {
+      await fetch("/api/auth/prefs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+    } catch { /* best-effort */ }
   };
 
   const loadPushSettings = async () => {
@@ -449,6 +606,7 @@ export default function DailyApp({ initialStage, username }: Props) {
       }
       toast.success("Passkey added");
       await loadPasskeys();
+      setHasWebauthn(true);
     } catch (e: any) {
       if (e?.name !== "NotAllowedError") {
         toast.error(e?.message ?? "Registration failed");
@@ -480,7 +638,10 @@ export default function DailyApp({ initialStage, username }: Props) {
   };
 
   // ============================================================
-  //  SPEECH TO TEXT
+  //  SPEECH TO TEXT (Hinglish-aware)
+  //  en-IN is the best native mode for Hinglish: Hindi words come out
+  //  transliterated in Latin script, mixed with English — exactly how users
+  //  type. hi-IN outputs pure Devanagari. Users pick per-device.
   // ============================================================
   const startListening = () => {
     const SpeechRecognition =
@@ -490,30 +651,76 @@ export default function DailyApp({ initialStage, username }: Props) {
       return;
     }
     const rec = new SpeechRecognition();
-    rec.lang = "en-IN";
-    rec.continuous = false;
+    rec.lang = voiceLang || "en-IN";
+    rec.continuous = true;          // keep listening through short pauses
     rec.interimResults = true;
+    rec.maxAlternatives = 1;
+    let finalSoFar = "";
     rec.onresult = (e: any) => {
-      let final = "";
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) final += e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalSoFar += e.results[i][0].transcript;
         else interim += e.results[i][0].transcript;
       }
-      setInput(final + interim);
+      setInput((finalSoFar + interim).replace(/\s+/g, " ").trimStart());
     };
     rec.onerror = (e: any) => {
-      if (e.error !== "no-speech") toast.error(`Voice error: ${e.error}`);
+      if (e.error !== "no-speech" && e.error !== "aborted") toast.error(`Voice error: ${e.error}`);
       setListening(false);
     };
-    rec.onend = () => setListening(false);
-    rec.start();
+    rec.onend = () => {
+      // continuous=true restarts itself unless stopped; if we're still in
+      // "listening" state (hold-to-talk still pressed), restart after silence
+      if (recognitionRef.current === rec && listening) {
+        try { rec.start(); } catch { setListening(false); }
+      } else {
+        setListening(false);
+      }
+    };
+    try {
+      rec.start();
+    } catch {
+      toast.error("Couldn't start the mic — try again");
+      return;
+    }
     recognitionRef.current = rec;
     setListening(true);
   };
   const stopListening = () => {
     recognitionRef.current?.stop();
+    recognitionRef.current = null;
     setListening(false);
+    // Refocus the input so the user can edit the transcript before sending
+    setTimeout(() => textareaRef.current?.focus(), 60);
+  };
+
+  // Press-and-hold the mic: hold ≥300ms = talk while held (release stops).
+  // A quick tap still toggles (accessibility + old habit).
+  const onMicPointerDown = () => {
+    heldRef.current = false;
+    holdTimerRef.current = window.setTimeout(() => {
+      heldRef.current = true;
+      if (!listening) startListening();
+    }, 300);
+  };
+  const onMicPointerUp = () => {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+    if (heldRef.current) {
+      if (listening) stopListening();
+    } else {
+      // Tap → toggle
+      if (listening) stopListening();
+      else startListening();
+    }
+  };
+  const onMicPointerLeave = () => {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
   };
 
   // ============================================================
@@ -558,7 +765,7 @@ export default function DailyApp({ initialStage, username }: Props) {
         setMessages((m) =>
           m.map((mm, i) =>
             i === m.length - 1
-              ? { ...mm, content: j.reply, pending: false }
+              ? { ...mm, content: j.reply, pending: false, chartSpec: j.chartSpec ?? null }
               : mm
           )
         );
@@ -645,8 +852,8 @@ export default function DailyApp({ initialStage, username }: Props) {
   // ============================================================
   const EXAMPLES = [
     "aaj 20 rs rapido ke kharch hue",
-    "2000 sip mein dale",
-    "shorya ne 30 hazar diye IPO ke liye SBI mein",
+    "2000 SIP mein dale",
+    "kitna balance hai SBI mein?",
   ];
 
   if (stage === "login") {
@@ -695,9 +902,26 @@ export default function DailyApp({ initialStage, username }: Props) {
             </button>
           </form>
           <p className="text-xs text-muted-foreground/80 mt-6 text-center">
-            Don&apos;t have an account? Ask your administrator to create one.
+            Don&apos;t have an account? Ask your{" "}
+            <a
+              href="mailto:request.Khata@namansoni.in?subject=Khata%20account%20request&body=Hi%2C%20please%20create%20a%20Khata%20account%20for%20me.%0A%0ARequested%20username%3A%20"
+              className="text-primary underline underline-offset-2 hover:opacity-80"
+            >
+              administrator
+            </a>{" "}
+            to create one.
           </p>
         </div>
+        <footer className="absolute bottom-5 left-0 right-0 text-center">
+          <a
+            href="https://github.com/NamanSoni78"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-[11px] text-muted-foreground/70 hover:text-muted-foreground transition-colors"
+          >
+            made with <span className="align-middle">❤️</span> by Naman
+          </a>
+        </footer>
       </div>
     );
   }
@@ -786,7 +1010,7 @@ export default function DailyApp({ initialStage, username }: Props) {
                 <div className="flex-1 h-px bg-border" />
               </div>
               <button
-                onClick={unlockWithWebauthn}
+                onClick={() => unlockWithWebauthn(false)}
                 disabled={webauthnUnlockLoading}
                 className="press w-full h-11 mt-4 rounded-xl border border-input bg-card text-foreground text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-60 hover:bg-accent/60 transition-colors"
               >
@@ -795,8 +1019,13 @@ export default function DailyApp({ initialStage, username }: Props) {
                 ) : (
                   <Fingerprint className="w-4 h-4 text-primary" />
                 )}
-                Use fingerprint
+                {webauthnUnlockLoading ? "Waiting for fingerprint…" : "Use fingerprint"}
               </button>
+              <p className="text-[11px] text-muted-foreground/70 mt-2.5 text-center">
+                {webauthnUnlockLoading
+                  ? "Touch your fingerprint sensor to sign in"
+                  : "Fingerprint prompt appears automatically — just touch the sensor"}
+              </p>
             </>
           )}
           <button
@@ -813,6 +1042,8 @@ export default function DailyApp({ initialStage, username }: Props) {
   // ============================================================
   //  CHAT STAGE
   // ============================================================
+  const wp = WALLPAPERS[wallpaper] ?? WALLPAPERS.none;
+
   return (
     <div className="h-dvh flex flex-col bg-background">
       {/* Header */}
@@ -842,6 +1073,16 @@ export default function DailyApp({ initialStage, username }: Props) {
             </div>
           </div>
           <div className="flex items-center gap-0.5">
+            {canInstall && (
+              <button
+                onClick={promptInstall}
+                className="press h-9 px-3 rounded-xl flex items-center gap-1.5 text-xs font-medium text-primary hover:bg-accent/50 transition-colors"
+                title="Install Khata on this device"
+              >
+                <Download className="w-4 h-4" />
+                <span className="hidden sm:inline">Install</span>
+              </button>
+            )}
             <a
               href="/dashboard"
               className="press h-9 px-3 rounded-xl flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors"
@@ -920,6 +1161,113 @@ export default function DailyApp({ initialStage, username }: Props) {
                 </div>
               </div>
 
+              {/* Chat wallpaper */}
+              <div className="border-t border-border pt-5">
+                <p className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                  <ImageIcon className="w-4 h-4 text-primary" /> Chat wallpaper
+                </p>
+                <p className="text-xs text-muted-foreground mt-0.5 mb-3">A subtle tint behind your messages. Saved to your account.</p>
+                <div className="grid grid-cols-3 gap-2">
+                  {Object.entries(WALLPAPERS).map(([key, w]) => (
+                    <button
+                      key={key}
+                      onClick={() => {
+                        setWallpaper(key);
+                        savePrefs({ wallpaper: key });
+                      }}
+                      className={`press h-12 rounded-xl border text-xs font-medium ${w.light} ${w.dark} flex items-center justify-center transition-colors ${
+                        wallpaper === key
+                          ? "border-primary ring-2 ring-ring/40"
+                          : "border-input text-muted-foreground hover:border-ring/50"
+                      }`}
+                    >
+                      {w.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Voice language */}
+              <div className="border-t border-border pt-5">
+                <p className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                  <Languages className="w-4 h-4 text-primary" /> Voice language
+                </p>
+                <p className="text-xs text-muted-foreground mt-0.5 mb-3">
+                  Hinglish works best in English (India) — Hindi words come out in English letters, mixed naturally.
+                </p>
+                <div className="grid grid-cols-3 gap-2">
+                  {[
+                    { id: "en-IN", label: "Hinglish" },
+                    { id: "hi-IN", label: "हिन्दी" },
+                    { id: "en-US", label: "English" },
+                  ].map((l) => (
+                    <button
+                      key={l.id}
+                      onClick={() => {
+                        setVoiceLang(l.id);
+                        try { localStorage.setItem(VOICE_LANG_KEY, l.id); } catch {}
+                      }}
+                      className={`press h-10 rounded-xl border text-xs font-medium flex items-center justify-center transition-colors ${
+                        voiceLang === l.id
+                          ? "border-primary bg-accent text-accent-foreground"
+                          : "border-input text-muted-foreground hover:border-ring/50"
+                      }`}
+                    >
+                      {l.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-muted-foreground/70 mt-2">Tip: hold the mic button to talk; release to stop.</p>
+              </div>
+
+              {/* Auto fingerprint */}
+              {hasWebauthn && (
+                <div className="border-t border-border pt-5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                        <Fingerprint className="w-4 h-4 text-primary" /> Instant fingerprint
+                      </p>
+                      <p className="text-xs text-muted-foreground mt-0.5">Ask for your fingerprint the moment the app opens</p>
+                    </div>
+                    <button
+                      onClick={() => {
+                        const next = !autoFingerprint;
+                        setAutoFingerprint(next);
+                        savePrefs({ autoFingerprint: next });
+                      }}
+                      className={`press h-8 px-3 rounded-lg border text-xs font-medium transition-colors ${
+                        autoFingerprint
+                          ? "border-primary bg-accent text-accent-foreground"
+                          : "border-input text-muted-foreground hover:border-ring/50"
+                      }`}
+                    >
+                      {autoFingerprint ? "On" : "Off"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Install app */}
+              {canInstall && (
+                <div className="border-t border-border pt-5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                        <Download className="w-4 h-4 text-primary" /> Install app
+                      </p>
+                      <p className="text-xs text-muted-foreground mt-0.5">Add Khata to your home screen</p>
+                    </div>
+                    <button
+                      onClick={promptInstall}
+                      className="press h-8 px-3 rounded-lg bg-primary text-primary-foreground text-xs font-medium"
+                    >
+                      Install
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* Passkeys */}
               <div className="border-t border-border pt-5">
                 <div className="flex items-center justify-between mb-2">
@@ -997,7 +1345,7 @@ export default function DailyApp({ initialStage, username }: Props) {
                   </button>
                 )}
                 <p className="text-[11px] text-muted-foreground/70 mt-3">
-                  Tip: you can also ask me things like &quot;remind me at 8pm daily&quot;.
+                  Tip: ask me things like &quot;remind me at 8pm daily&quot; or &quot;send my day&apos;s summary at 9:10pm&quot;.
                 </p>
               </div>
             </div>
@@ -1006,8 +1354,26 @@ export default function DailyApp({ initialStage, username }: Props) {
       )}
 
       {/* Messages */}
-      <main className="flex-1 overflow-y-auto" style={{ minHeight: 0 }}>
+      <main
+        ref={scrollMainRef}
+        onScroll={onMainScroll}
+        className={`flex-1 overflow-y-auto transition-colors ${wp.light} ${wp.dark}`}
+        style={{ minHeight: 0 }}
+      >
         <div className="max-w-2xl mx-auto px-4 py-4 space-y-2.5">
+          {loadingOlder && (
+            <div className="flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground py-1">
+              <Loader className="w-3 h-3 animate-spin" /> loading earlier messages…
+            </div>
+          )}
+          {hasMoreHistory && !loadingOlder && (
+            <button
+              onClick={loadOlderMessages}
+              className="press mx-auto flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground py-1"
+            >
+              <ChevronUp className="w-3 h-3" /> load earlier messages
+            </button>
+          )}
           {messages.length === 0 && (
             <div className="text-center py-10 anim-fade-up">
               <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-accent text-accent-foreground mb-4">
@@ -1029,7 +1395,7 @@ export default function DailyApp({ initialStage, username }: Props) {
                 ))}
               </div>
               <p className="text-[11px] text-muted-foreground/70 mt-5 flex items-center justify-center gap-1.5">
-                <Mic className="w-3 h-3" /> Tap the mic to speak instead
+                <Mic className="w-3 h-3" /> Hold the mic to speak
               </p>
             </div>
           )}
@@ -1053,7 +1419,8 @@ export default function DailyApp({ initialStage, username }: Props) {
                   </span>
                 ) : (
                   <>
-                    <span className="whitespace-pre-wrap break-words">{m.content}</span>
+                    <Markdown text={m.content} />
+                    {m.chartSpec && <InlineChartReveal spec={m.chartSpec} />}
                     {m.queued && (
                       <span className="inline-flex items-center gap-1 text-[10px] opacity-80 mt-1 block">
                         <Clock3 className="w-3 h-3" /> queued
@@ -1091,13 +1458,16 @@ export default function DailyApp({ initialStage, username }: Props) {
           )}
           <button
             type="button"
-            onClick={listening ? stopListening : startListening}
-            className={`press shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center transition-all ${
+            onPointerDown={onMicPointerDown}
+            onPointerUp={onMicPointerUp}
+            onPointerLeave={onMicPointerLeave}
+            onContextMenu={(e) => e.preventDefault()}
+            className={`press shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center transition-all select-none touch-none ${
               listening
                 ? "bg-destructive text-white anim-rec-pulse"
                 : "bg-card border border-border text-muted-foreground hover:text-foreground hover:border-ring/50"
             }`}
-            title="Voice input"
+            title="Hold to talk (or tap to toggle)"
           >
             {listening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
           </button>
@@ -1112,7 +1482,7 @@ export default function DailyApp({ initialStage, username }: Props) {
                   sendMessage();
                 }
               }}
-              placeholder={listening ? "Listening…" : uploadingStatement ? "Reading your file…" : "Tell me about a transaction…"}
+              placeholder={listening ? "Listening… (release to stop)" : uploadingStatement ? "Reading your file…" : "Tell me about a transaction…"}
               rows={1}
               className="w-full resize-none bg-transparent px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none max-h-32"
               style={{ minHeight: "44px" }}

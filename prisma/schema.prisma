@@ -21,6 +21,7 @@ model User {
   username     String   @unique
   passwordHash String
   isActive     Boolean  @default(true)
+  prefs        String   @default("{}") // JSON: per-user UI preferences (chat wallpaper, voice language, etc.)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -242,17 +243,35 @@ model PushSubscription {
 }
 
 model ScheduledNotification {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   userId      String
-  schedule    String   // cron expr OR ISO timestamp for one-time
+  // Structured schedule (v2) — calendar-style, no cron strings in the UI:
+  //   type: 'once' | 'daily' | 'weekly' | 'monthly'
+  //   time: 'HH:MM' 24h in the user's timezone (IST)
+  //   date: 'YYYY-MM-DD' (once only)
+  //   daysOfWeek: JSON array of 0-6 (weekly only, 0=Sunday)
+  //   dayOfMonth: 1-31 (monthly only)
+  //   nextRunAt: precomputed UTC Date — the poll endpoint just compares & fires
+  // Legacy `schedule` (cron / ISO) kept for backward compatibility with old rows.
+  type        String    @default("daily")
+  time        String    @default("20:00")
+  date        String?   // YYYY-MM-DD, once only
+  daysOfWeek  String    @default("[]") // JSON array e.g. "[1,3,5]"
+  dayOfMonth  Int?
+  timezone    String    @default("Asia/Kolkata")
+  nextRunAt   DateTime?
+  schedule    String    @default("") // legacy cron expr OR ISO timestamp (kept for old rows)
+  title       String    @default("Khata")
   message     String
-  template    String?  // optional template with placeholders
+  template    String?   // optional template with placeholders
   lastFiredAt DateTime?
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  isActive    Boolean   @default(true)
+  qstashScheduleId String? // Upstash QStash schedule id (per-reminder exact-time delivery)
+  createdAt   DateTime  @default(now())
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, isActive])
+  @@index([isActive, nextRunAt])
 }
 
 // ============================================================

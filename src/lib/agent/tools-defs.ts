@@ -32,7 +32,7 @@ export const DAILY_TOOLS: ToolDefinition[] = [
           },
           contact: {
             type: "string",
-            description: "Contact name if expense is to a person (e.g., 'paid Shorya back 500')",
+            description: "Contact name if expense is to a person (e.g., 'paid Rahul back 500')",
           },
           timestamp: {
             type: "string",
@@ -45,7 +45,7 @@ export const DAILY_TOOLS: ToolDefinition[] = [
           },
           group_label: {
             type: "string",
-            description: "Optional label to link this txn to a multi-leg group (e.g., 'Shorya SBI IPO plan'). If the group doesn't exist, it's created. Use the SAME label across all legs of a complex scenario so they're linked.",
+            description: "Optional label to link this txn to a multi-leg group (e.g., 'Rahul SBI IPO plan'). If the group doesn't exist, it's created. Use the SAME label across all legs of a complex scenario so they're linked.",
           },
         },
         required: ["amount", "category"],
@@ -57,7 +57,7 @@ export const DAILY_TOOLS: ToolDefinition[] = [
     function: {
       name: "log_income",
       description:
-        "Log income (money coming in). Use when user describes receiving money. Examples: 'salary 50k aaya', 'shorya ne 30 hazar diye', 'refund 500 mila'.",
+        "Log income (money coming in). Use when user describes receiving money. Examples: 'salary 50k aaya', 'rahul ne 30 hazar diye', 'refund 500 mila'.",
       parameters: {
         type: "object",
         properties: {
@@ -100,7 +100,7 @@ export const DAILY_TOOLS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "link_transactions",
-      description: "Link two or more existing transactions into a multi-leg group. Use this when you realize AFTER logging that some txns belong together (e.g., 'Shorya's 30k loan + IPO investment + 10k profit' should be one group).",
+      description: "Link two or more existing transactions into a multi-leg group. Use this when you realize AFTER logging that some txns belong together (e.g., 'a friend2019s 30k loan + IPO investment + 10k profit' should be one group).",
       parameters: {
         type: "object",
         properties: {
@@ -157,11 +157,11 @@ export const DAILY_TOOLS: ToolDefinition[] = [
     function: {
       name: "create_contact",
       description:
-        "Create a NEW contact (person) in the user's schema. ONLY call when user mentions a person not in schema-in-context. Examples: 'mere dost Shorya ne...', 'bhai ne diya'.",
+        "Create a NEW contact (person) in the user's schema. ONLY call when user mentions a person not in schema-in-context. Examples: 'mere dost Rahul ne...', 'bhai ne diya'.",
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Contact name (e.g., 'Shorya')" },
+          name: { type: "string", description: "Contact name (e.g., 'Rahul')" },
           type: {
             type: "string",
             enum: ["friend", "family", "colleague", "merchant", "other"],
@@ -199,33 +199,28 @@ export const DAILY_TOOLS: ToolDefinition[] = [
     function: {
       name: "retrieve_transactions",
       description:
-        "Semantic search over your transaction history. Use when the user asks a natural-language question about past spending or income (e.g., 'show me my rapido expenses', 'what did I spend on food last month', 'how much did I lend Shorya'). Returns ranked matches with relevance scores. Active especially in RAG schema-mode when recent transactions aren't all in your context.",
+        "Semantic search over transaction history. Use when the user asks a natural-language question about past spending, income or money sent to someone (e.g., 'show me my rapido expenses', 'how much money did I send to Rahul 3 months ago', 'what did I spend on food last month'). Always pass from_date/to_date (computed from the current date in context) when the user mentions any relative time — '3 months ago', 'last week', 'June', etc. Returns ranked matches with amounts + timestamps.",
       parameters: {
         type: "object",
         properties: {
-          query: { type: "string", description: "Natural-language query describing what the user is asking about (e.g., 'rapido rides', 'food with friends', 'IPO investment with Shorya')" },
+          query: { type: "string", description: "Natural-language query describing what the user is asking about (e.g., 'money sent to Rahul', 'rapido rides', 'food with friends')" },
           top_n: { type: "number", description: "Max matches to return (default 25)" },
           days: { type: "number", description: "Look-back window in days (default 90). Use 365 for last year, 1825 for last 5 years." },
-          from_date: { type: "string", description: "ISO date (YYYY-MM-DD) lower bound (overrides days)" },
+          from_date: { type: "string", description: "ISO date (YYYY-MM-DD) lower bound (overrides days). COMPUTE this from current date for any relative-time question." },
           to_date: { type: "string", description: "ISO date (YYYY-MM-DD) upper bound" },
         },
         required: ["query"],
       },
     },
   },
-];
-
-// ============================================================
-//  Dashboard-only tools (more powerful — for analysis)
-// ============================================================
-
-export const DASHBOARD_TOOLS: ToolDefinition[] = [
+  // ---- Analysis tools (shared with the dashboard agent — the daily chat can
+  //      answer analytical questions and offer charts directly) ----
   {
     type: "function",
     function: {
       name: "query_transactions",
       description:
-        "Query the user's transactions with filters. Returns matching transactions as JSON.",
+        "Query the user's transactions with structured filters (date range, type, account, contact, category). Returns matching transactions as JSON. Use for 'show all my expenses from 1st to 15th', 'everything from my SBI account in June', etc.",
       parameters: {
         type: "object",
         properties: {
@@ -245,7 +240,7 @@ export const DASHBOARD_TOOLS: ToolDefinition[] = [
     function: {
       name: "aggregate",
       description:
-        "Aggregate transactions by a dimension (sum, count, avg). Returns JSON { dimension_value, total_amount, count, avg_amount }[]. Use for totals like 'month expense by category'.",
+        "Aggregate transactions by a dimension (sum, count, avg). Returns JSON { dimension_value, total_amount, count, avg_amount }[]. Use for totals like 'month expense by category', 'how much did I send to Rahul between March and May'.",
       parameters: {
         type: "object",
         properties: {
@@ -262,7 +257,7 @@ export const DASHBOARD_TOOLS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "get_account_summary",
-      description: "Get a snapshot of all user accounts with current balances and recent activity.",
+      description: "Get a snapshot of all user accounts with CURRENT live balances. Use whenever the user asks 'how much do I have', 'what's my balance', 'net worth', or before answering questions that depend on current balances.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -270,7 +265,7 @@ export const DASHBOARD_TOOLS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "list_groups",
-      description: "List all multi-leg transaction groups for this user (with leg counts, net amount, creation date). Use when user asks 'show me Shorya's IPO plan' or 'what groups do I have'.",
+      description: "List all multi-leg transaction groups for this user (with leg counts, net amount, creation date). Use when user asks 'show me the IPO plan' or 'what groups do I have'.",
       parameters: {
         type: "object",
         properties: {
@@ -283,7 +278,7 @@ export const DASHBOARD_TOOLS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "get_group_summary",
-      description: "Get full details of a single transaction group: all legs with their types, amounts, accounts, contacts, timestamps. Use when user asks 'tell me about Shorya's IPO plan'.",
+      description: "Get full details of a single transaction group: all legs with their types, amounts, accounts, contacts, timestamps. Use when user asks 'tell me about the IPO plan'.",
       parameters: {
         type: "object",
         properties: {
@@ -297,14 +292,20 @@ export const DASHBOARD_TOOLS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "create_scheduled_notification",
-      description: "Schedule a recurring or one-time push notification. Use when user says things like 'remind me at 8pm daily' or 'send me a notification at 9:10pm tomorrow with my today totals'.",
+      description:
+        "Schedule a push-notification reminder with a calendar-style schedule. Use when the user says 'remind me at 8pm daily', 'send me my day's summary at 9:10pm', 'notify me next Monday at 6am', 'every month on the 1st at 10am'. NEVER output cron expressions — pass structured fields. Message may include placeholders: {today_income}, {today_expense}, {month_income}, {month_expense}.",
       parameters: {
         type: "object",
         properties: {
-          schedule: { type: "string", description: "Cron expression (e.g., '0 20 * * *' for daily 8pm) OR ISO 8601 timestamp for one-time" },
-          message: { type: "string", description: "Message text. Can include placeholders: {today_income}, {today_expense}, {month_income}, {month_expense}" },
+          type: { type: "string", enum: ["once", "daily", "weekly", "monthly"], description: "Repeat kind" },
+          time: { type: "string", description: "'HH:MM' 24-hour IST, e.g. '20:00' for 8pm, '21:10' for 9:10pm" },
+          date: { type: "string", description: "YYYY-MM-DD — required when type=once. Compute from current date in context ('tomorrow' = current date + 1)." },
+          days: { type: "array", items: { type: "number" }, description: "Weekdays 0=Sunday…6=Saturday — required when type=weekly, e.g. [1] Monday, [1,3,5] Mon/Wed/Fri" },
+          day_of_month: { type: "number", description: "1-31 — required when type=monthly" },
+          title: { type: "string", description: "Short notification title (default 'Khata')" },
+          message: { type: "string", description: "Message text. May include {today_income} {today_expense} {month_income} {month_expense}" },
         },
-        required: ["schedule", "message"],
+        required: ["type", "time", "message"],
       },
     },
   },
@@ -324,6 +325,32 @@ export const DASHBOARD_TOOLS: ToolDefinition[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "search_chat_history",
+      description:
+        "Search the user's ENTIRE saved chat history (every message ever exchanged, far beyond recent context). Use when the user refers to an old conversation or something they told you before that isn't in recent context — e.g. 'what did I say about the ICICI account last month?', 'wo baat jo maine march mein boli thi'.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Keywords to search for in past messages" },
+          from_date: { type: "string", description: "ISO date (YYYY-MM-DD) lower bound" },
+          to_date: { type: "string", description: "ISO date (YYYY-MM-DD) upper bound" },
+          limit: { type: "number", description: "Max matches (default 15)" },
+        },
+        required: ["query"],
+      },
+    },
+  },
+];
+
+// ============================================================
+//  Dashboard-only tools (mindmap agentic edits — the review UI lives in
+//  the dashboard; everything else is shared with DAILY_TOOLS above)
+// ============================================================
+
+export const DASHBOARD_TOOLS: ToolDefinition[] = [
   {
     type: "function",
     function: {

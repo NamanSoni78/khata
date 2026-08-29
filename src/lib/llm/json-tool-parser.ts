@@ -38,6 +38,35 @@ export function stripFencedJsonBlocks(text: string): string {
 }
 
 /**
+ * Attempt to repair common LLM JSON quirks before parsing:
+ *   - trailing commas before } or ]
+ *   - smart quotes used as JSON string delimiters
+ *   - literal newlines inside strings are handled fine by JSON.parse only when
+ *     escaped; unescaped control chars are escaped here.
+ */
+function tryParseJson(raw: string): unknown | undefined {
+  const attempts = [
+    raw,
+    // Remove trailing commas: ,} -> } and ,] -> ]
+    raw.replace(/,\s*([}\]])/g, "$1"),
+    // Smart quotes -> straight quotes
+    raw.replace(/[\u201c\u201d]/g, '"').replace(/\u2018|\u2019/g, "'"),
+    // Both fixes
+    raw
+      .replace(/[\u201c\u201d]/g, '"')
+      .replace(/,\s*([}\]])/g, "$1"),
+  ];
+  for (const a of attempts) {
+    try {
+      return JSON.parse(a);
+    } catch {
+      /* try next */
+    }
+  }
+  return undefined;
+}
+
+/**
  * Scan the input text for balanced `{...}` JSON objects.
  * Returns an array of `{ raw, json }` pairs where `raw` is the exact
  * substring matched (including the outer braces), and `json` is the same
@@ -97,24 +126,81 @@ export function parseJsonToolCalls(
   const toolCalls: ParsedToolCall[] = [];
 
   for (const { raw } of matches) {
-    try {
-      const parsed = JSON.parse(raw) as { tool_call?: { name?: string; arguments?: unknown } };
-      if (parsed?.tool_call?.name && typeof parsed.tool_call.name === "string") {
+    const parsed = tryParseJson(raw) as
+      | { tool_call?: { name?: string; arguments?: unknown }; name?: string; arguments?: unknown }
+      | undefined;
+    if (parsed) {
+      // Accept BOTH the documented {"tool_call":{name,arguments}} wrapper AND
+      // the flat {"name":...,"arguments":...} shape some models emit.
+      const name =
+        (parsed.tool_call && typeof parsed.tool_call.name === "string" && parsed.tool_call.name) ||
+        (typeof parsed.name === "string" && parsed.name) ||
+        null;
+      const args =
+        (parsed.tool_call && parsed.tool_call.arguments) ||
+        parsed.arguments ||
+        {};
+      if (name && typeof name === "string" && KNOWN_TOOL_NAME_HINT.test(name)) {
         toolCalls.push({
           id: `json_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${toolCalls.length}`,
-          name: parsed.tool_call.name,
-          arguments: (parsed.tool_call.arguments as Record<string, unknown>) ?? {},
+          name,
+          arguments: (args as Record<string, unknown>) ?? {},
         });
         // Strip the matched JSON block from the user-visible content
         text = text.replace(raw, "");
       }
-    } catch {
-      // Not a valid tool_call wrapper — leave it in content.
     }
+    // Not a valid tool_call wrapper — leave it in content.
   }
 
   return {
     content: text.replace(/\n{3,}/g, "\n\n").trim(),
     toolCalls,
   };
+}
+
+/**
+ * Heuristic: a parsed object is only treated as a tool call when its name
+ * looks like one of our tools (snake_case identifier). Prevents random JSON
+ * objects (chart specs, user data) from being swallowed as tool calls.
+ */
+const KNOWN_TOOL_NAME_HINT = /^[a-z][a-z0-9_]{2,40}$/;
+
+/**
+ * LAST-LINE-OF-DEFENSE sanitizer for user-visible assistant text.
+ *
+ * Even with the parser above, models occasionally leak a tool-call JSON in the
+ * FINAL text reply (e.g. when the loop hits the iteration cap and the last
+ * content still carries the JSON, or when the model re-states the call as an
+ * example). Users should NEVER see raw {"tool_call":...} in the chat bubble.
+ *
+ * This strips:
+ *   - any balanced {"tool_call":{...}} / {"name":...,"arguments":...} objects
+ *     (also inside code fences),
+ *   - leftover fenced blocks that contain nothing but a tool call,
+ *   - the "[CHART:{...}]" marker is NOT touched here (handled separately).
+ */
+export function sanitizeAssistantText(text: string): string {
+  if (!text || !text.includes("{")) return text;
+
+  let out = stripFencedJsonBlocks(text);
+  const objs = extractBalancedJsonObjects(out);
+  for (const { raw } of objs) {
+    const parsed = tryParseJson(raw) as any;
+    if (
+      parsed &&
+      ((parsed.tool_call && typeof parsed.tool_call.name === "string") ||
+        (typeof parsed.name === "string" &&
+          typeof parsed.arguments === "object" &&
+          KNOWN_TOOL_NAME_HINT.test(parsed.name)))
+    ) {
+      out = out.split(raw).join("");
+    }
+  }
+  // Clean orphaned fence remnants + excess blank lines
+  out = out
+    .replace(/```[a-zA-Z0-9]*\s*```/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return out;
 }

@@ -3,6 +3,7 @@
  * Each takes (userId, args) and returns a string result for the LLM.
  */
 import { db } from "@/lib/db";
+import { createReminder, describeReminder } from "@/lib/scheduler";
 
 type Args = Record<string, unknown>;
 
@@ -415,12 +416,56 @@ export async function getAccountSummary(userId: string, _args: Args): Promise<st
 }
 
 export async function createScheduledNotification(userId: string, args: Args): Promise<string> {
-  const schedule = String(args.schedule);
-  const message = String(args.message);
-  const notif = await db.scheduledNotification.create({
-    data: { userId, schedule, message, isActive: true },
-  });
-  return `Scheduled notification created (ID: ${notif.id}). Schedule: ${schedule}. Message: ${message}. NOTE: Actual push delivery requires Web Push subscription + QStash integration (Phase 3).`;
+  // Structured calendar-style args (v2) — the agent NEVER emits cron strings.
+  const type = String(args.type ?? "daily") as "once" | "daily" | "weekly" | "monthly";
+  const time = String(args.time ?? "");
+  const message = String(args.message ?? "");
+  if (!message) return "Error: message is required";
+  if (!/^\d{1,2}:\d{2}$/.test(time)) {
+    return "Error: time must be HH:MM (24-hour, IST), e.g. '20:00' or '9:10'.";
+  }
+  if (!["once", "daily", "weekly", "monthly"].includes(type)) {
+    return `Error: unknown type '${type}' (use once | daily | weekly | monthly)`;
+  }
+
+  let daysOfWeek: number[] | undefined;
+  let dayOfMonth: number | undefined;
+  let date: string | undefined;
+  if (type === "weekly") {
+    const raw = Array.isArray(args.days) ? args.days : [];
+    daysOfWeek = raw.map((d) => Number(d)).filter((d) => d >= 0 && d <= 6);
+    if (daysOfWeek.length === 0) return "Error: weekly reminders need 'days' (0=Sunday … 6=Saturday)";
+  }
+  if (type === "monthly") {
+    dayOfMonth = Number(args.day_of_month ?? 1);
+    if (!(dayOfMonth >= 1 && dayOfMonth <= 31)) return "Error: day_of_month must be 1-31";
+  }
+  if (type === "once") {
+    date = args.date ? String(args.date) : undefined;
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return "Error: one-time reminders need 'date' as YYYY-MM-DD (use the current date from context for 'today')";
+    }
+  }
+
+  try {
+    const row = await createReminder(userId, {
+      type,
+      time,
+      date,
+      daysOfWeek,
+      dayOfMonth,
+      title: args.title ? String(args.title) : "Khata",
+      message,
+      timezone: "Asia/Kolkata",
+    });
+    const desc = describeReminder(row);
+    const needsSub = !(await db.pushSubscription.count({ where: { userId } }));
+    return `Reminder created: "${message}" — ${desc} (ID: ${row.id}).${
+      needsSub ? " NOTE: the user has no push subscription on any device yet — tell them to enable notifications in the daily app's Settings." : ""
+    }`;
+  } catch (e: any) {
+    return `Error: ${e?.message ?? "could not create reminder"}`;
+  }
 }
 
 export async function exportData(userId: string, args: Args): Promise<string> {
@@ -808,6 +853,71 @@ export async function retrieveTransactions(userId: string, args: Args): Promise<
 }
 
 // ============================================================
+//  CHAT HISTORY SEARCH (infinite-context support)
+// ============================================================
+
+/**
+ * Search the user's FULL persisted chat history (all messages ever saved,
+ * including those far outside the context window). The agent uses this when a
+ * question refers to an old conversation ("what did I tell you about the
+ * ICICI account last month?"), making context effectively infinite.
+ */
+export async function searchChatHistory(userId: string, args: Args): Promise<string> {
+  const query = String(args.query ?? "").toLowerCase().trim();
+  if (!query) return "Error: query is required";
+  const limit = Math.min(Number(args.limit ?? 15), 50);
+
+  const where: any = { userId, role: { in: ["user", "assistant"] } };
+  if (args.from_date || args.to_date) {
+    where.createdAt = {};
+    if (args.from_date) where.createdAt.gte = new Date(args.from_date as string);
+    if (args.to_date) {
+      const t = new Date(args.to_date as string);
+      t.setHours(23, 59, 59, 999);
+      where.createdAt.lte = t;
+    }
+  }
+
+  // Pull a wide candidate set (most recent first, capped) and keyword-score it.
+  const candidates = await db.chatMessage.findMany({
+    where,
+    orderBy: { createdAt: "desc" },
+    take: 2000,
+  });
+  if (candidates.length === 0) return JSON.stringify({ matches: [], note: "No chat history found." });
+
+  const tokens = query.split(/\s+/).filter((t) => t.length > 1);
+  const scored = candidates.map((m) => {
+    const hay = " " + (m.content || "").toLowerCase() + " ";
+    let score = 0;
+    for (const tok of tokens) {
+      let idx = hay.indexOf(tok);
+      while (idx >= 0) { score += 1; idx = hay.indexOf(tok, idx + tok.length); }
+    }
+    return { m, score };
+  });
+
+  const matches = scored
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score || b.m.createdAt.getTime() - a.m.createdAt.getTime())
+    .slice(0, limit)
+    .map(({ m, score }) => ({
+      role: m.role,
+      content: m.content.slice(0, 500),
+      at: m.createdAt.toISOString(),
+      relevance: score,
+    }));
+
+  return JSON.stringify({
+    query,
+    scanned: candidates.length,
+    matches_returned: matches.length,
+    matches,
+    note: matches.length === 0 ? "Nothing found — try different keywords or a wider date range." : undefined,
+  });
+}
+
+// ============================================================
 //  Tool dispatcher
 // ============================================================
 
@@ -827,6 +937,7 @@ export async function dispatchTool(
     case "aggregate": return aggregate(userId, args);
     case "get_account_summary": return getAccountSummary(userId, {});
     case "retrieve_transactions": return retrieveTransactions(userId, args);
+    case "search_chat_history": return searchChatHistory(userId, args);
     case "create_scheduled_notification": return createScheduledNotification(userId, args);
     case "export_data": return exportData(userId, args);
     case "link_transactions": return linkTransactions(userId, args);

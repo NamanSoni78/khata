@@ -1,23 +1,31 @@
 /**
  * Agent conversation loop:
  * 1. Build system prompt (with time + schema + recent txns)
- * 2. Load last N chat messages from DB
+ * 2. Load last N chat messages from DB (N admin-configurable)
  * 3. Call LLM with user's new message
  * 4. If LLM returned tool calls, dispatch them, append results, call LLM again
  * 5. Repeat until no more tool calls (or 5 iterations max)
  * 6. Persist final assistant message + return to caller
+ *
+ * Final assistant text is ALWAYS run through `sanitizeAssistantText` so users
+ * never see leaked {"tool_call":...} JSON, and through `extractChartMarker` so
+ * the [CHART:{...}] spec rides along in metadata (not in the visible bubble).
  */
 import { db } from "@/lib/db";
 import { chatComplete, type LLMMessage, type ToolDefinition } from "@/lib/llm/client";
+import { sanitizeAssistantText } from "@/lib/llm/json-tool-parser";
+import { extractChartMarker, type ChartSpec } from "@/lib/agent/chart-marker";
 import type { AgentConfig } from "@/lib/admin-config";
+import { getSchemaMode } from "@/lib/admin-config";
 import { dispatchTool } from "./tools";
 import { buildDailySystemPrompt, buildDashboardSystemPrompt } from "./prompt-builder";
 
 const MAX_TOOL_ITERATIONS = 5;
-const HISTORY_LIMIT = 12; // last N chat messages to load into context
+const DEFAULT_HISTORY_LIMIT = 24; // last N chat messages fed to the LLM
 
 export interface AgentRunResult {
   assistantText: string;
+  chartSpec: ChartSpec | null;
   toolCalls: Array<{ name: string; args: Record<string, unknown>; result: string }>;
   tokensUsed: number;
 }
@@ -40,11 +48,17 @@ export async function runAgent(opts: {
       ? await buildDailySystemPrompt(userId, basePrompt)
       : await buildDashboardSystemPrompt(userId, basePrompt);
 
-  // 2. Load history
+  // 2. Load history (admin-configurable window; older turns stay reachable
+  //    via the search_chat_history tool — effectively infinite context)
+  const schemaMode = await getSchemaMode();
+  const historyLimit =
+    typeof (schemaMode as { chatHistoryLimit?: number }).chatHistoryLimit === "number"
+      ? Math.max(4, Math.min(80, (schemaMode as { chatHistoryLimit: number }).chatHistoryLimit))
+      : DEFAULT_HISTORY_LIMIT;
   const history = await db.chatMessage.findMany({
     where: { userId },
     orderBy: { createdAt: "desc" },
-    take: HISTORY_LIMIT,
+    take: historyLimit,
   });
   history.reverse();
 
@@ -121,14 +135,10 @@ async function runAgentInner(opts: {
       // dispatched, the model is stuck in a loop. Stop here with the text
       // it produced, rather than re-dispatching + hitting the iteration limit.
       if (uniqueToolCalls.length === 0) {
-        lastAssistantText = res.content || lastAssistantText;
-        await db.chatMessage.create({
-          data: {
-            userId,
-            role: "assistant",
-            content: res.content,
-            metadata: JSON.stringify({ toolCalls: [], duplicateSkipped: res.toolCalls.length }),
-          },
+        lastAssistantText = sanitizeAssistantText(res.content || lastAssistantText);
+        await persistFinalAssistantMessage(userId, lastAssistantText, {
+          toolCalls: [],
+          duplicateSkipped: res.toolCalls.length,
         });
         break;
       }
@@ -141,12 +151,13 @@ async function runAgentInner(opts: {
         content: res.content,
         toolCalls: uniqueToolCalls,
       });
-      // Persist this assistant turn (with the unique tool calls) to DB
+      // Persist this assistant turn (with the unique tool calls) to DB.
+      // The content is sanitized so history never carries leaked JSON either.
       await db.chatMessage.create({
         data: {
           userId,
           role: "assistant",
-          content: res.content,
+          content: sanitizeAssistantText(res.content ?? ""),
           metadata: JSON.stringify({ toolCalls: uniqueToolCalls }),
         },
       });
@@ -172,25 +183,18 @@ async function runAgentInner(opts: {
         });
       }
       // Continue the loop to let the model summarize the tool results
-      lastAssistantText = res.content;
+      lastAssistantText = sanitizeAssistantText(res.content);
       continue;
     }
 
     // No tool calls — final text response
-    lastAssistantText = res.content;
-    await db.chatMessage.create({
-      data: {
-        userId,
-        role: "assistant",
-        content: res.content,
-        metadata: JSON.stringify({ toolCalls: [] }),
-      },
-    });
+    lastAssistantText = sanitizeAssistantText(res.content);
+    await persistFinalAssistantMessage(userId, lastAssistantText, { toolCalls: [] });
     break;
   }
 
   if (iteration >= MAX_TOOL_ITERATIONS) {
-    lastAssistantText = lastAssistantText || "(agent hit tool-call limit; stopping)";
+    lastAssistantText = lastAssistantText || "(the assistant took too many steps — please try again)";
   }
 
   // === POST-PROCESSING: AUTO-LINK MULTI-LEG TXNS ===
@@ -199,11 +203,51 @@ async function runAgentInner(opts: {
   // group (covers cases where the LLM forgot group_label on some legs).
   await autoLinkTurnTxnsToGroup(userId, executedToolCalls);
 
+  // Extract chart marker (if the agent offered a chart) so the UI can render
+  // a "Show as chart" button. Persisted text stays clean; spec rides in metadata.
+  const { cleanText, chartSpec } = extractChartMarker(lastAssistantText);
+  if (chartSpec) {
+    await attachChartSpecToLastMessage(userId, chartSpec);
+  }
+
   return {
-    assistantText: lastAssistantText,
+    assistantText: cleanText,
+    chartSpec,
     toolCalls: executedToolCalls,
-    tokensUsed: 0, // Phase 1: not tracked precisely
+    tokensUsed: 0,
   };
+}
+
+/** Persist the final assistant message for this turn. */
+async function persistFinalAssistantMessage(
+  userId: string,
+  content: string,
+  meta: Record<string, unknown>
+): Promise<void> {
+  await db.chatMessage.create({
+    data: {
+      userId,
+      role: "assistant",
+      content,
+      metadata: JSON.stringify(meta),
+    },
+  });
+}
+
+/** Attach a parsed chart spec to the most recent assistant message. */
+async function attachChartSpecToLastMessage(userId: string, chartSpec: ChartSpec): Promise<void> {
+  const last = await db.chatMessage.findFirst({
+    where: { userId, role: "assistant" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!last) return;
+  let meta: Record<string, unknown> = {};
+  try { meta = JSON.parse(last.metadata || "{}"); } catch { meta = {}; }
+  meta.chartSpec = chartSpec;
+  await db.chatMessage.update({
+    where: { id: last.id },
+    data: { metadata: JSON.stringify(meta) },
+  });
 }
 
 /**

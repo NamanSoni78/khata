@@ -1,154 +1,204 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { sendPushToUser, resolveMessageTemplate, isWebPushConfigured } from "@/lib/notifications/push";
+import { computeNextRun } from "@/lib/scheduler";
 
 /**
- * Cron endpoint — called by Upstash QStash (or manually) to fire scheduled notifications.
+ * Reminder delivery endpoint — hit by Upstash QStash (Vercel-free friendly).
  *
- * Scheduling types:
- *  - One-time: schedule is ISO timestamp. Fire when now >= schedule. After firing, set isActive=false.
- *  - Recurring: schedule is cron expression (e.g., "0 20 * * *" for daily 8pm IST).
- *    Fire when lastFiredAt is null OR next cron occurrence after lastFiredAt is <= now.
+ * TWO MODES:
+ *  1. EXACT-TIME (preferred): QStash schedules/delayed-publishes hit
+ *     /api/notifications/cron?rid=<reminderId> at the exact minute.
+ *  2. CATCH-ALL POLL (fallback): one QStash cron job (every 5 min) hits this
+ *     endpoint without rid; it fires every active reminder whose nextRunAt
+ *     is due. Catches missed exact fires, legacy rows, and deployments without
+ *     a QSTASH_TOKEN.
  *
- * Auth: optionally protected by QSTASH_TOKEN check (if env set, request must include header).
- *
- * To set up:
- *   1. Generate VAPID keys: bun run gen-vapid
- *   2. Add to Vercel env: NEXT_PUBLIC_VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT
- *   3. Create Upstash QStash schedule that POSTs to {your-app}/api/notifications/cron every 5 minutes
- *   4. Pass QSTASH_TOKEN to authorize the cron endpoint (optional but recommended)
+ * AUTH — request must pass ONE of:
+ *  - Upstash server signature (JWT HS256 with QSTASH_CURRENT_SIGNING_KEY or
+ *    QSTASH_NEXT_SIGNING_KEY) in the `Upstash-Signature` header
+ *  - Bearer token matching QSTASH_TOKEN
+ *  - If NEITHER env var is set, the endpoint stays open (local dev).
  */
 export async function POST(req: NextRequest) {
-  // Optional auth via QStash token
-  const qstashToken = process.env.QSTASH_TOKEN;
-  if (qstashToken) {
-    const authHeader = req.headers.get("authorization");
-    const bearer = req.headers.get("x-upstash-authorization");
-    const provided = authHeader?.replace(/^Bearer\s+/i, "") ?? bearer;
-    // Allow either QSTASH_TOKEN match OR skip check if env not set
-    if (provided && provided !== qstashToken) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-    }
+  const auth = await verifyQStashRequest(req);
+  if (!auth.ok) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   if (!isWebPushConfigured()) {
     return NextResponse.json({ skipped: true, reason: "Web Push not configured" });
   }
 
+  const url = new URL(req.url);
+  const rid = url.searchParams.get("rid");
   const now = new Date();
-  // Fetch all active scheduled notifications
-  const schedules = await db.scheduledNotification.findMany({
-    where: { isActive: true },
-    take: 500,
+
+  // ---- Mode 1: exact-time fire for a specific reminder ----
+  if (rid) {
+    const rem = await db.scheduledNotification.findFirst({
+      where: { id: rid, isActive: true },
+    });
+    if (!rem) return NextResponse.json({ ok: true, fired: 0, reason: "not found or inactive" });
+    // Guard: only fire if actually due (or within a 10-min early/late window for
+    // one-timers whose delayed publish drifted).
+    const due = rem.nextRunAt ? rem.nextRunAt.getTime() <= now.getTime() + 10 * 60 * 1000 : true;
+    if (!due) {
+      return NextResponse.json({ ok: true, fired: 0, reason: "not due yet", nextRunAt: rem.nextRunAt });
+    }
+    const r = await fireReminder(rem, now);
+    return NextResponse.json({ ok: true, fired: r.sent > 0 ? 1 : 0, ...r });
+  }
+
+  // ---- Mode 2: catch-all poll — fire everything due ----
+  const dueRows = await db.scheduledNotification.findMany({
+    where: { isActive: true, nextRunAt: { lte: now } },
+    take: 200,
   });
 
-  let firedCount = 0;
-  let skippedCount = 0;
+  let fired = 0;
+  for (const rem of dueRows) {
+    const r = await fireReminder(rem, now);
+    if (r.sent > 0) fired++;
+  }
 
-  for (const sched of schedules) {
-    const shouldFire = shouldFireNow(sched.schedule, sched.lastFiredAt, now);
-    if (!shouldFire) {
-      skippedCount++;
-      continue;
+  // Legacy rows (pre-v2, cron/ISO strings) — best-effort migration to v2 fields
+  try {
+    const legacy = await db.scheduledNotification.findMany({
+      where: { isActive: true, nextRunAt: null, schedule: { not: "" } },
+      take: 100,
+    });
+    for (const row of legacy) {
+      const iso = /^\d{4}-\d{2}-\d{2}T/.test(row.schedule);
+      const next = iso ? new Date(row.schedule) : computeNextRun(row);
+      await db.scheduledNotification.update({
+        where: { id: row.id },
+        data: { nextRunAt: next },
+      });
     }
-
-    // Resolve placeholders in message
-    const message = await resolveMessageTemplate(sched.userId, sched.message);
-
-    // Send push
-    const result = await sendPushToUser(sched.userId, {
-      title: "Finance Tracker",
-      body: message,
-      url: "/",
-    });
-
-    if (result.sent > 0) firedCount++;
-
-    // Update lastFiredAt. For one-time schedules, deactivate after firing.
-    const isOneTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(sched.schedule);
-    await db.scheduledNotification.update({
-      where: { id: sched.id },
-      data: {
-        lastFiredAt: now,
-        isActive: !isOneTime,
-      },
-    });
+  } catch (e) {
+    console.error("[cron] legacy migration error:", e);
   }
 
   return NextResponse.json({
     ok: true,
-    checked: schedules.length,
-    fired: firedCount,
-    skipped: skippedCount,
+    checked: dueRows.length,
+    fired,
     at: now.toISOString(),
   });
 }
 
-/**
- * Determine whether a schedule should fire now.
- * - One-time (ISO timestamp): fire if now >= schedule AND lastFiredAt is null.
- * - Cron: fire if lastFiredAt is null OR the next cron occurrence after lastFiredAt is <= now.
- *   For simplicity, this implementation fires if lastFiredAt is older than the cron's min interval.
- *   (Proper cron parsing requires a cron lib — for Phase 2 we use simple interval inference.)
- */
-function shouldFireNow(schedule: string, lastFiredAt: Date | null, now: Date): boolean {
-  // Try ISO timestamp first
-  const asDate = new Date(schedule);
-  if (!isNaN(asDate.getTime())) {
-    // One-time schedule
-    return now >= asDate && lastFiredAt === null;
-  }
+async function fireReminder(
+  rem: {
+    id: string;
+    userId: string;
+    type: string;
+    time: string;
+    date: string | null;
+    daysOfWeek: string;
+    dayOfMonth: number | null;
+    title: string;
+    message: string;
+    lastFiredAt: Date | null;
+  },
+  now: Date
+): Promise<{ sent: number; failed: number }> {
+  const message = await resolveMessageTemplate(rem.userId, rem.message);
+  const result = await sendPushToUser(rem.userId, {
+    title: rem.title || "Khata",
+    body: message,
+    url: "/",
+  });
 
-  // Cron expression — use simple heuristic
-  // For "0 20 * * *" (daily 8pm), interval is 24h. Fire if lastFiredAt is null OR > 23h ago.
-  // For "*/5 * * * *" (every 5 min), interval is 5 min.
-  // For "0 9 * * 1" (Mondays 9am), interval is 7 days.
-  // This is approximate — for precise cron math, integrate `cron-parser` in Phase 3.
-
-  // Check the cron field structure
-  const parts = schedule.split(/\s+/);
-  if (parts.length !== 5) return false;
-
-  // Try to infer interval from cron
-  let intervalMs = 24 * 60 * 60 * 1000; // default 24h (daily)
-  if (parts[0].startsWith("*/")) {
-    const n = parseInt(parts[0].slice(2));
-    if (!isNaN(n)) intervalMs = n * 60 * 1000;
-  } else if (parts[1].startsWith("*/")) {
-    const n = parseInt(parts[1].slice(2));
-    if (!isNaN(n)) intervalMs = n * 60 * 60 * 1000;
-  }
-
-  if (!lastFiredAt) {
-    // First fire — check if current time matches cron
-    return matchesCron(parts, now);
-  }
-  const sinceLast = now.getTime() - lastFiredAt.getTime();
-  return sinceLast >= intervalMs && matchesCron(parts, now);
+  const isOneTime = rem.type === "once";
+  await db.scheduledNotification.update({
+    where: { id: rem.id },
+    data: {
+      lastFiredAt: now,
+      isActive: !isOneTime,
+      nextRunAt: isOneTime ? null : computeNextRun(rem),
+    },
+  });
+  return result;
 }
 
-function matchesCron(parts: string[], now: Date): boolean {
-  // minutes, hours, day-of-month, month, day-of-week
-  const [minP, hourP, domP, monP, dowP] = parts;
-  const m = now.getMinutes();
-  const h = now.getHours();
-  const dom = now.getDate();
-  const mon = now.getMonth() + 1;
-  const dow = now.getDay();
-  return (
-    matchField(minP, m) &&
-    matchField(hourP, h) &&
-    matchField(domP, dom) &&
-    matchField(monP, mon) &&
-    matchField(dowP, dow)
-  );
+// ============================================================
+//  QStash auth — server signature (JWT HS256) or bearer token
+// ============================================================
+
+async function verifyQStashRequest(req: NextRequest): Promise<{ ok: boolean; reason?: string }> {
+  const token = process.env.QSTASH_TOKEN;
+  const signingKeys = [
+    process.env.QSTASH_CURRENT_SIGNING_KEY,
+    process.env.QSTASH_NEXT_SIGNING_KEY,
+  ].filter(Boolean) as string[];
+
+  // No auth configured (local dev) — allow.
+  if (!token && signingKeys.length === 0) return { ok: true };
+
+  // 1. Bearer token check
+  if (token) {
+    const authHeader = req.headers.get("authorization");
+    const bearer = authHeader?.replace(/^Bearer\s+/i, "");
+    if (bearer && bearer === token) return { ok: true };
+  }
+
+  // 2. Upstash server signature check (JWT in Upstash-Signature header).
+  //    Upstash may send several signatures (space-separated) during key rotation.
+  const sigHeader = req.headers.get("upstash-signature");
+  if (sigHeader && signingKeys.length > 0) {
+    for (const sig of sigHeader.split(" ")) {
+      for (const key of signingKeys) {
+        if (await verifyUpstashJWT(sig, key)) return { ok: true };
+      }
+    }
+  }
+
+  return { ok: false, reason: "unauthorized" };
 }
 
-function matchField(pattern: string, value: number): boolean {
-  if (pattern === "*") return true;
-  if (pattern.startsWith("*/")) {
-    const n = parseInt(pattern.slice(2));
-    return !isNaN(n) && value % n === 0;
+/** Verify an Upstash server-signature JWT (HS256) with Web Crypto. */
+async function verifyUpstashJWT(jwt: string, signingKey: string): Promise<boolean> {
+  try {
+    const parts = jwt.split(".");
+    if (parts.length !== 3) return false;
+    const [head, body, sig] = parts;
+
+    // Header must declare HS256
+    const header = JSON.parse(atobUrl(head));
+    if (header.alg !== "HS256") return false;
+
+    // Signature check: HMAC-SHA256(key, "head.body") base64url
+    const enc = new TextEncoder();
+    const cryptoKey = await crypto.subtle.importKey(
+      "raw",
+      enc.encode(signingKey),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    const mac = await crypto.subtle.sign("HMAC", cryptoKey, enc.encode(`${head}.${body}`));
+    const expected = btoaUrl(new Uint8Array(mac));
+    if (expected !== sig) return false;
+
+    // Claims check: expiry (Upstash gives ~2 min leeway)
+    const claims = JSON.parse(atobUrl(body));
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (typeof claims.exp === "number" && claims.exp < nowSec - 120) return false;
+    if (typeof claims.nbf === "number" && claims.nbf > nowSec + 120) return false;
+    return true;
+  } catch {
+    return false;
   }
-  return pattern.split(",").some((p) => parseInt(p) === value);
+}
+
+function atobUrl(s: string): string {
+  const b = s.replace(/-/g, "+").replace(/_/g, "/");
+  return atob(b + "=".repeat((4 - (b.length % 4)) % 4));
+}
+
+function btoaUrl(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }

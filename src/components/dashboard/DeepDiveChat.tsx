@@ -4,6 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import { toast } from "sonner";
 import { Loader2, Send, Sparkles } from "lucide-react";
 import { InlineChartReveal, type ChartSpec } from "@/components/charts/InlineChart";
+import Markdown from "@/components/chat/Markdown";
 
 interface ChatMsg {
   id: number;
@@ -74,7 +75,7 @@ export default function DeepDiveChat() {
   const SUGGESTIONS = [
     "Break down my expenses this month by category",
     "Income vs expense trend over the last 3 months",
-    "How much did I lend Shorya?",
+    "How much money did I send to friends in the last 3 months?",
     "Create a mindmap of my investment accounts",
   ];
 
@@ -119,7 +120,7 @@ export default function DeepDiveChat() {
                     : "bg-card border border-border text-foreground rounded-bl-md"
                 }`}
               >
-                <p className="whitespace-pre-wrap break-words">{m.text}</p>
+                <Markdown text={m.text} />
                 {m.chartSpec && <InlineChartReveal spec={m.chartSpec} />}
               </div>
             </div>

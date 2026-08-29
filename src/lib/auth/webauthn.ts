@@ -25,13 +25,13 @@ import { db } from "@/lib/db";
 export function getRpInfo(req?: Request) {
   const envOverride = process.env.NEXT_PUBLIC_RP_ID;
   if (envOverride) {
-    return { rpID: envOverride, rpName: "Finance Tracker" };
+    return { rpID: envOverride, rpName: "Khata" };
   }
   if (req) {
     const url = new URL(req.url);
-    return { rpID: url.hostname, rpName: "Finance Tracker" };
+    return { rpID: url.hostname, rpName: "Khata" };
   }
-  return { rpID: "localhost", rpName: "Finance Tracker" };
+  return { rpID: "localhost", rpName: "Khata" };
 }
 
 /**

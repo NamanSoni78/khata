@@ -20,6 +20,9 @@ export async function GET() {
     }),
     getFeatureFlags(),
   ]);
+  let prefs: Record<string, unknown> = {};
+  try { prefs = JSON.parse(user.prefs || "{}"); } catch { prefs = {}; }
+
   return NextResponse.json({
     authenticated: true,
     username: user.username,
@@ -32,6 +35,8 @@ export async function GET() {
       createdAt: c.createdAt.toISOString(),
       credentialIdShort: c.credentialId.slice(0, 12) + "...",
     })),
+    // Per-user UI preferences (wallpaper, voice language, auto fingerprint…)
+    prefs,
     // Feature flags (so the UI knows which upload buttons to show)
     flags: {
       pdfUpload: flags.pdfUpload,

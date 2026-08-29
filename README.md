@@ -1,48 +1,72 @@
-# Finance Tracker PWA
+# Khata — Finance Tracker PWA
 
 A production-grade multi-tenant personal finance tracker built as a PWA on Next.js 16 + Prisma + Neon serverless Postgres.
+Lives at **khata.namansoni.in**.
 
 Three routes, three threat models:
 
 | Route | Auth | Idle timeout | Use case |
 |---|---|---|---|
-| `/` | Username + MPIN or WebAuthn passkey | 30 days | Daily expense logging via chat / voice (Hinglish-aware) |
-| `/dashboard` | Username + password (re-entry required) | **15 minutes idle** (active sessions auto-extend) | Weekly deep-dive: budgets, multi-period charts, AI agent, mindmap editor, exports |
+| `/` | Username + MPIN or WebAuthn passkey (fingerprint auto-prompts on open) | 30 days | Daily expense logging via chat / voice (Hinglish-aware) — **plus full analytical powers: charts, totals, date-range queries, reminders, exports** |
+| `/dashboard` | Username + password (re-entry required) | **15 minutes idle** (active sessions auto-extend) | Weekly deep-dive: budgets, multi-period charts, AI agent, mindmap editor, imports, exports, reminders |
 | `/admin` | `ADMIN_USERNAME` / `ADMIN_PASSWORD` env vars | 2 hours | Developer panel: per-agent LLM config, feature flags, system prompts, glossary, users, DB status |
 
 ## Highlights
 
 - **Hinglish-aware transaction parsing** — understands natural multi-leg scenarios like
-  *"Shorya ne 30 hazar diye IPO ke liye SBI mein, pichle IPO ka 10k profit PNB mein hai"* and
-  logs all 4 legs (income → IPO investment → event → profit) as one linked transaction group.
-- **Per-agent model picker** — admin chooses provider + model per agent (daily chat / dashboard analysis / STT / OCR).
-  Three protocols supported: **OpenAI-compatible** (Groq, OpenAI, DeepSeek, OpenRouter, LM Studio),
-  and **Anthropic-native**. Models without native tool-calling (e.g. Gemma) get a built-in JSON fallback mode.
-- **Liquid schema** — agent can create accounts / contacts / categories mid-conversation; admin can
-  toggle between LLM mode (full schema in prompt) and RAG mode (on-demand retrieval, no vector DB).
-- **Bank statement parsing** — upload PDFs or paste raw text; agent extracts transactions, runs
-  duplicate detection (±5% amount + ±3 days), and asks clarifying questions before logging dups.
-- **OCR (vision) extraction** — admin enables OCR + configures a vision-capable model (OpenAI gpt-4o,
-  Anthropic Sonnet, or OpenRouter Gemini); users can then upload images of receipts / statements.
+  *"Rahul ne 30 hazar diye IPO ke liye SBI mein, pichle baar ka 10k profit PNB mein aaya"* and
+  logs all legs as one linked transaction group.
+- **One chat does everything** — the daily `/` agent has the full analytical toolkit:
+  live balances (always in context), date-range queries ("3 months ago how much did I send to Rahul?"),
+  aggregations, and inline **charts** (text-first, then a "Show as chart" reveal).
+- **Markdown in chat** — agent replies render `**bold**`, lists, tables, code.
+- **No tool-call JSON leaks** — a hardened parser + final-reply sanitizer guarantee users never see
+  raw `{"tool_call":...}` (works in both native and JSON-fallback tool-calling modes).
+- **Effectively infinite context** — admin-sized recent-history window per call, plus a
+  `search_chat_history` tool that searches EVERY past message, plus RAG transaction retrieval.
+- **Chat history pagination** — UI loads the latest 100 messages; scrolling up fetches older
+  pages from the DB on demand (everything is always saved).
+- **Calendar-style reminders (no cron!)** — daily / weekly (weekday chips) / monthly / once,
+  with date + time pickers. Delivered via **Upstash QStash**: per-reminder exact-time schedules
+  (IST auto-converted to UTC cron) + a 5-min catch-all poll fallback + HMAC signature verification.
+  Live placeholders: `{today_income} {today_expense} {month_income} {month_expense}`.
+- **Import from any AI** — copy `public/addingaccountsprompt.md` (a strict interview-style system
+  prompt) into ChatGPT/Claude/Gemini, answer its questions (it can also fold in your CSV data),
+  then paste its markdown/JSON block into Dashboard → Accounts → **Import data**. Conflicts with
+  existing accounts/contacts are surfaced with keep-mine / use-imported choices.
+- **Per-agent model picker** — admin chooses provider + model per agent (daily chat / dashboard /
+  STT / OCR). **OpenAI-compatible** (Groq, OpenAI, DeepSeek, OpenRouter, LM Studio) + **Anthropic-native**.
+  Models without native tool-calling (e.g. Gemma) get the JSON fallback mode.
+- **Liquid schema** — agent creates accounts / contacts / categories mid-conversation; admin can
+  toggle LLM mode (full schema in prompt) vs RAG mode (on-demand retrieval).
+- **Bank statement parsing** — PDFs / pasted text with duplicate detection (±5% amount + ±3 days);
+  optional OCR/vision for images (admin-gated).
+- **Instant unlock** — fingerprint prompt fires automatically on open (touch sensor → in);
+  MPIN fallback; per-user auto-prompt toggle.
+- **Voice input** — hold-to-talk mic with a Hinglish-optimized language picker
+  (en-IN default: Hindi words come out in Latin script), hi-IN and en-US options.
+- **PWA installable** — PNG icons + manifest + `beforeinstallprompt` handling (Chrome suggests
+  install; in-app Install button too). Offline message queue flushes when back online.
 - **Multi-period charts** — day (hourly), week/month (daily), 3m/6m (weekly), 1y/custom (monthly).
-- **Mindmap editor** — React Flow canvas with form-edit + agentic-edit + undo/redo + explicit Save.
-  Agent proposes edits via `propose_mindmap_edit`; UI shows a review-apply-discard panel.
-- **Dashboard AI deep-dive chat** — agent offers charts by appending a `[CHART:{...}]` marker;
-  UI shows text reply first + a "📊 Show as chart" reveal button (text-first, chart-on-demand).
+- **Mindmap editor** — React Flow canvas: view + form-edit + agentic edit + undo/redo + explicit Save.
 - **PDF + CSV exports** — server-side PDFKit-generated, paginated, striped rows.
-- **Web Push notifications** — VAPID + service worker + Upstash QStash cron (5-min interval).
-- **WebAuthn passkeys** — register fingerprint / Face ID / hardware key as alternative daily unlock.
-- **PWA installable** — manifest + service worker (app-shell cache, push listener, background sync).
+- **Web Push notifications** — VAPID + service worker + QStash scheduling.
+- **Chat wallpaper** — subtle per-user tints (saved to the account, synced across devices).
+- **SEO** — canonical URL, OpenGraph, robots.txt (API/admin/dashboard disallowed), sitemap.xml.
+  No FAQ clutter — the app stays a clean daily-use tool.
+- **Configurable reply pacing** — the ONLY delay in the pipeline is the admin-set
+  `uxConfig.replyDelayMs` (default 0 = off). Everything else streams as fast as the model answers.
 
 ## Tech stack
 
 - **Frontend**: Next.js 16 App Router, Tailwind CSS, shadcn/ui, Recharts, React Flow (`@xyflow/react`)
-- **Backend**: Next.js API routes (server actions), Prisma ORM, Neon serverless Postgres (SQLite in dev)
-- **LLM clients**: OpenAI-compatible (Groq/OpenAI/DeepSeek/OpenRouter/LM Studio) + Anthropic-native, with a JSON fallback for models without tool-calling
-- **Auth**: Auth.js credentials + `@simplewebauthn/server` + bcrypt MPIN
+- **Backend**: Next.js API routes, Prisma ORM, Neon serverless Postgres
+- **LLM clients**: OpenAI-compatible (Groq/OpenAI/DeepSeek/OpenRouter/LM Studio) + Anthropic-native,
+  with a JSON fallback for models without tool-calling
+- **Auth**: credentials + bcrypt + `@simplewebauthn/server` (passkeys) + bcrypt MPIN
 - **PDF**: `pdf-parse` (input) + `pdfkit` (export)
-- **Push**: `web-push` + VAPID + Upstash QStash
-- **Voice**: Web Speech API (default) or OpenAI-compatible Whisper-style endpoint (admin-configurable)
+- **Push**: `web-push` + VAPID + Upstash QStash (schedules + delayed publish)
+- **Voice**: Web Speech API (native, language-selectable) or admin-configured OpenAI-compatible STT
 
 ---
 
@@ -50,9 +74,8 @@ Three routes, three threat models:
 
 ### Prerequisites
 
-- **Node.js 18+** (or **Bun** — preferred, the repo uses `bun.lock`)
-- **Git**
-- An LLM API key for at least one provider (Groq has a free tier)
+- **Node.js 18+** (or **Bun** — preferred)
+- A Neon Postgres database (free tier is enough) — or a local Postgres
 
 ### First-time setup
 
@@ -60,11 +83,11 @@ Three routes, three threat models:
 # 1. Install deps
 bun install   # or: npm install
 
-# 2. Copy .env and edit if needed
-cp .env.example .env  # (or just use the existing .env — already set for dev)
-# Edit .env to set ADMIN_USERNAME / ADMIN_PASSWORD before first deploy
+# 2. Configure env
+cp .env.example .env
+# Edit .env — set DATABASE_URL (Neon pooled string) and ADMIN_USERNAME / ADMIN_PASSWORD
 
-# 3. Push the SQLite schema + seed defaults
+# 3. Push the schema + seed defaults
 bun run db:push
 bun run db:seed
 
@@ -80,194 +103,149 @@ Default admin login (change before deploy!): `admin` / `admin123`.
 
 | Command | Purpose |
 |---|---|
-| `bun run db:push` | Create/alter tables (no migrations needed in dev) |
-| `bun run db:seed` | Seed default admin config (agent defaults, glossary, feature flags) |
-| `bun run db:reset` | Drop + recreate everything (DESTRUCTIVE) |
+| `bun run db:push` | Create/alter tables (no migrations needed) |
+| `bun run db:seed` | Seed default admin config (agents, flags, glossary, UX config) |
 | `bun run gen-vapid` | Generate VAPID keypair for Web Push |
-| `bun run hash-password <pw>` | bcrypt-hash a password (for `ADMIN_PASSWORD` env var) |
+| `bun run gen-icons` | Regenerate PNG PWA icons from the SVG mark |
+| `bun run hash-password <pw>` | bcrypt-hash the admin password |
 | `bun run lint` | ESLint check |
-| `bun run build` | Production build |
 
 ### Verifying the install end-to-end
 
-After `bun run db:seed`, the admin panel defaults to Groq llama-3.3-70b with an empty API key —
-set your key in `/admin > Agents` first. Smoke-test:
-
-1. Go to <http://localhost:3000/admin>, log in with `admin` / `admin123`.
-2. Go to **Users** tab → create a user `demo` / `demo123`.
-3. Go to <http://localhost:3000/> → log in as `demo` / `demo123` → set MPIN `1234`.
+1. `/admin` → log in → **Agents** tab → set your API key (presets available) → **Test connection**.
+2. **Users** tab → create a user `demo` / `demo123`.
+3. `/` → log in as `demo` → set MPIN `1234`.
 4. In chat, type: `aaj 20rs rapido ke kharch hue`
-   - Agent should call `log_expense(amount=20, category=Transport)` and reply "Logged Rs 20 for Transport."
-5. Go to <http://localhost:3000/dashboard> → log in again with `demo` / `demo123`.
-   - You should see the Rs 20 Transport expense in the current-month summary + recent transactions table.
+   - Agent calls `log_expense(amount=20, category=Transport)` and replies "Logged Rs 20 for Transport."
+5. Try an analytical question: `3 months ago how much money did I send?` or `kitna balance hai?`
+   - Agent uses date-range tools / live balances, may offer a chart.
+6. Try a reminder: `remind me at 9:10pm daily with my day's totals`
+   - Agent calls `create_scheduled_notification(type=daily, time=21:10, message=...)`.
+7. `/dashboard` → log in again → Accounts → **Copy AI prompt** → paste into any chatbot →
+   **Import data** → paste the result → review → import.
 
 ---
 
 ## Production deployment
 
-### Step 1 — Provision a Neon Postgres database
+### Step 1 — Provision Neon Postgres
 
-1. Sign up at <https://neon.tech> (free tier is enough to start — 0.5 GB storage, unlimited projects).
-2. Create a new project; pick the region closest to your Vercel deployment region.
-3. Copy the connection string. It looks like:
-   ```
-   postgresql://user:password@ep-xxx-xxx-pooler.region.aws.neon.tech/dbname?sslmode=require
-   ```
-   Use the **pooled** connection string for the app (the `-pooler` hostname).
+1. Sign up at <https://neon.tech> (free tier: 0.5 GB storage).
+2. Create a project; pick the region closest to your Vercel deployment.
+3. Copy the **pooled** connection string (`...-pooler...` host) with `?sslmode=require`.
 
-### Step 2 — Switch Prisma to Postgres
+### Step 2 — Deploy to Vercel
 
-Edit `prisma/schema.prisma`:
-
-```prisma
-datasource db {
-  provider = "postgresql"   // was "sqlite"
-  url      = env("DATABASE_URL")
-}
-```
-
-The schema is portable: all JSON-ish fields are stored as `String` and use `JSON.stringify` / `JSON.parse`
-in app code, so no schema changes are needed when switching providers. No enums (Postgres-compatible).
-
-### Step 3 — Deploy to Vercel
-
-1. Push your repo to GitHub.
-2. Go to <https://vercel.com> → **New Project** → import the repo.
-3. Vercel auto-detects Next.js. Set:
-   - **Framework Preset**: Next.js
-   - **Build Command**: `bun run build` (or `npm run build`)
-   - **Output Directory**: `.next` (default)
-4. In **Settings → Environment Variables**, add (see table below for full list):
-
-| Variable | Required? | Purpose |
-|---|---|---|
-| `DATABASE_URL` | **Yes** | Neon Postgres connection string (with `?sslmode=require`) |
-| `ADMIN_USERNAME` | **Yes** | Admin panel username (for `/admin`) |
-| `ADMIN_PASSWORD` | **Yes** | Plain text OR bcrypt hash (`$2b$...`) — preferred |
-| `NEXT_PUBLIC_VAPID_PUBLIC_KEY` | For push | VAPID public key (run `bun run gen-vapid` locally to generate) |
-| `VAPID_PRIVATE_KEY` | For push | VAPID private key |
-| `VAPID_SUBJECT` | For push | E.g. `mailto:admin@example.com` |
-| `NEXT_PUBLIC_RP_ID` | For WebAuthn | Your domain (e.g. `yourapp.vercel.app`) — otherwise auto-derived |
-| `QSTASH_TOKEN` | For scheduled notifs | Upstash QStash token (see Step 5) |
-| `QSTASH_CURRENT_SIGNING_KEY` | For QStasth signature verification | From Upstash console |
-| `QSTASH_NEXT_SIGNING_KEY` | For QStash key rotation | From Upstash console |
-
-5. Deploy. Vercel runs `prisma generate` automatically as part of `postinstall` (Prisma is a dep).
-6. After first deploy, run the schema push + seed **once** against the Neon DB:
+1. Push the repo to GitHub → Vercel → **New Project** → import.
+2. Set the environment variables (see table below).
+3. Deploy, then run the schema push + seed **once** against Neon:
 
    ```bash
-   # From your local machine, with DATABASE_URL pointing at Neon:
    DATABASE_URL='postgresql://...?sslmode=require' bun run db:push
    DATABASE_URL='postgresql://...?sslmode=require' bun run db:seed
    ```
 
-   Or use Vercel's CLI: `vercel env pull .env.production.local && bun run db:push && bun run db:seed`.
+### Environment variables
 
-### Step 4 — Configure VAPID keys (Web Push)
+| Variable | Required? | Purpose |
+|---|---|---|
+| `DATABASE_URL` | **Yes** | Neon Postgres connection string (pooled, `?sslmode=require`) |
+| `ADMIN_USERNAME` | **Yes** | Admin panel username |
+| `ADMIN_PASSWORD` | **Yes** | Plain text OR bcrypt hash (`$2b$...`) — preferred |
+| `NEXT_PUBLIC_APP_URL` | Recommended | `https://khata.namansoni.in` — SEO metadata, sitemap, QStash callback URLs |
+| `NEXT_PUBLIC_RP_ID` | For WebAuthn | `khata.namansoni.in` — otherwise auto-derived from the request host |
+| `NEXT_PUBLIC_VAPID_PUBLIC_KEY` | For push | VAPID public key (`bun run gen-vapid`) |
+| `VAPID_PRIVATE_KEY` | For push | VAPID private key |
+| `VAPID_SUBJECT` | For push | e.g. `mailto:you@example.com` |
+| `QSTASH_TOKEN` | For reminders | Upstash QStash token — enables per-reminder exact-time schedules |
+| `QSTASH_CURRENT_SIGNING_KEY` | Recommended | Verifies Upstash-signed cron requests |
+| `QSTASH_NEXT_SIGNING_KEY` | Recommended | Same, for key rotation |
 
-1. Generate a VAPID keypair locally:
-   ```bash
-   bun run gen-vapid
-   # Prints:
-   # NEXT_PUBLIC_VAPID_PUBLIC_KEY=BPxxxxxxxxxxxxxxxxxxxxxxxxxx
-   # VAPID_PRIVATE_KEY=xxxxxxxxxxxxxxxxxxxxx
-   ```
-2. In Vercel **Settings → Environment Variables**, add:
-   - `NEXT_PUBLIC_VAPID_PUBLIC_KEY` (must be prefixed with `NEXT_PUBLIC_` so the browser sees it)
-   - `VAPID_PRIVATE_KEY`
-   - `VAPID_SUBJECT=mailto:you@yourdomain.com`
-3. Redeploy. Users can now subscribe to push notifications in the daily app's Settings sheet.
+### Step 3 — Configure VAPID keys (Web Push)
 
-### Step 5 — Configure Upstash QStash (scheduled notifications)
+```bash
+bun run gen-vapid
+# → set NEXT_PUBLIC_VAPID_PUBLIC_KEY + VAPID_PRIVATE_KEY + VAPID_SUBJECT in Vercel → redeploy
+```
 
-The app exposes `POST /api/notifications/cron` which fires any due `ScheduledNotification`s.
-You need a cron to hit this every 5 minutes.
+### Step 4 — Configure Upstash QStash (scheduled notifications)
+
+Reminders are delivered by **Upstash QStash** (works on Vercel free — no Vercel cron needed):
 
 1. Sign up at <https://upstash.com> → QStash.
-2. From the QStash dashboard, copy the **Token** + **Current Signing Key** + **Next Signing Key**.
-3. Add them to Vercel env vars (`QSTASH_TOKEN`, `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY`).
-4. In QStash dashboard → **Cron Jobs** → **Create**:
-   - **Cron expression**: `*/5 * * * *` (every 5 minutes — minimum allowed interval)
-   - **URL**: `https://yourapp.vercel.app/api/notifications/cron`
+2. Copy **Token** + **Current Signing Key** + **Next Signing Key** into Vercel env vars.
+3. **Exact-time delivery (automatic):** with `QSTASH_TOKEN` set, every recurring reminder
+   registers its own QStash schedule (IST time auto-converted to a UTC cron) hitting
+   `/api/notifications/cron?rid=<id>` at the exact minute; one-time reminders use a delayed
+   publish. Deleting/pausing a reminder cancels its QStash schedule.
+4. **Catch-all poll (set up once, recommended):** QStash dashboard → Cron Jobs → Create:
+   - **Cron expression**: `*/5 * * * *`
+   - **URL**: `https://khata.namansoni.in/api/notifications/cron`
    - **Method**: POST
-5. QStash signs each request with HMAC; the cron endpoint verifies the signature (if `QSTASH_CURRENT_SIGNING_KEY`
-   is set) before firing notifications — so a malicious actor can't spam your users by hitting the URL.
 
-### Step 6 — Configure LLM providers (in `/admin`)
+   This fires any reminder whose `nextRunAt` is due — a belt-and-suspenders fallback.
+5. The cron endpoint verifies Upstash server signatures (JWT HS256 with your signing keys)
+   and/or the `QSTASH_TOKEN` bearer — randoms can't spam your users.
 
-After deploy, log into `/admin` and configure your LLM agents. Each agent has a row of preset chips:
+### Step 5 — Import your existing accounts (optional but recommended)
 
-**General agents (daily chat, dashboard analysis, STT):**
-- **Groq llama-3.3-70b** — free tier, native tool-calling, excellent reasoning (recommended default for production).
-- **Gemma 3 27B (Groq)** — free, no native tool-calling — flip the "tool calling" toggle OFF and the JSON fallback mode kicks in.
-- **Groq llama-3.1-8b** — free, ultra-fast, best for STT-like low-latency tasks.
-- **OpenAI gpt-4o** — paid, best reasoning + vision-capable. Best for dashboard deep-dive + mindmap agentic edits.
-- **OpenAI gpt-4o-mini** — paid, ~30x cheaper than gpt-4o, good balance for daily chat.
-- **OpenAI o3-mini** — paid reasoning model. Uses `max_completion_tokens` (auto-set by preset).
-- **Anthropic Sonnet / Haiku** — paid, native tool-calling, Sonnet is vision-capable for OCR.
-- **DeepSeek V3** — paid, very cheap, strong reasoning. Note: hosted in China — verify data residency.
-- **OpenRouter Gemini 2.5 Flash** — paid, multimodal (vision-capable for OCR), cheap.
+1. `/dashboard` → Accounts → **Copy AI prompt** (copies `public/addingaccountsprompt.md`).
+2. Paste it into ANY AI chatbot. It interviews you about accounts, balances, contacts,
+   categories — and can fold in CSV data you paste/upload.
+3. Copy the formatted block it produces → Accounts → **Import data** → paste → review → Import.
+4. Fix anything left by asking the chat assistant ("update my SBI balance to 5000").
 
-**OCR agent (vision-capable only):**
-- OpenAI gpt-4o, gpt-4o-mini, Anthropic Sonnet, OpenRouter Gemini 2.5 Flash.
+### Step 6 — Configure LLM agents (in `/admin`)
 
-Click a preset to fill the form. Enter your API key separately. Click **Save**, then **Test connection**.
+Each agent row has preset chips (Groq llama-3.3-70b recommended default; Gemma 3 works with the
+tool-calling toggle OFF via JSON fallback; OpenAI/Anthropic/OpenRouter/DeepSeek all supported).
+Enter the API key, Save, then **Test connection**.
+
+- **Daily chat** — Groq llama-3.3-70b or OpenAI gpt-4o-mini
+- **Dashboard analysis** — OpenAI gpt-4o or Anthropic Sonnet (strong multi-step reasoning)
+- **STT** — leave on Native (free) or configure an OpenAI-compatible Whisper endpoint
+- **OCR** — vision-capable only: gpt-4o, Sonnet, Gemini Flash
 
 ### Step 7 — Production checklist
 
-- [ ] `ADMIN_PASSWORD` set to a bcrypt hash (not plain text) — run `bun run hash-password` locally
-- [ ] VAPID keys generated + set as Vercel env vars
-- [ ] QStash cron hitting `/api/notifications/cron` every 5 minutes
-- [ ] `NEXT_PUBLIC_RP_ID` set to your domain (so WebAuthn works on the production domain)
-- [ ] All 4 agents configured in `/admin`:
-  - [ ] Daily chat — recommend Groq llama-3.3-70b or OpenAI gpt-4o-mini
-  - [ ] Dashboard analysis — recommend OpenAI gpt-4o or Anthropic Sonnet (strong multi-step reasoning)
-  - [ ] STT — leave on Native (Web Speech API) for free, or switch to Groq llama-3.1-8b + Whisper endpoint
-  - [ ] OCR — OpenAI gpt-4o (best on dense Indian bank statements) or Gemini 2.5 Flash (cheap)
-- [ ] Feature flags set in `/admin`:
-  - [ ] `pdfUpload` ON (if you want bank statement PDFs)
-  - [ ] `ocr` ON (if you configured a vision agent above)
-  - [ ] `sttNative` ON (or OFF if you configured an OpenAI-compatible STT endpoint)
-  - [ ] `webPush` ON (if VAPID configured)
-  - [ ] `autoAppendTotals` ON (recommended — appends today/month totals to each chat reply)
-  - [ ] `defaultLanguage` — set to `english` (default), `hinglish`, or `hindi`
-- [ ] Schema-in-context mode chosen (in `/admin` → Context/Time):
-  - [ ] **LLM mode** (recommended for users < 5k txns — faster, no extra round-trips)
-  - [ ] **RAG mode** (only for users with 5k+ txns — saves tokens, adds latency for historical queries)
-- [ ] Glossary reviewed (66 finance terms seeded by default — IPO, SIP, FD, demat, etc.)
-- [ ] Test the full flow end-to-end: create user → set MPIN → log a txn via chat → view in dashboard
+- [ ] `ADMIN_PASSWORD` set to a bcrypt hash (not plain text)
+- [ ] VAPID keys generated + set
+- [ ] QStash token + signing keys set; catch-all `*/5 * * * *` cron on `/api/notifications/cron`
+- [ ] `NEXT_PUBLIC_APP_URL=https://khata.namansoni.in` set (SEO + QStash callbacks)
+- [ ] `NEXT_PUBLIC_RP_ID=khata.namansoni.in` set (WebAuthn on the production domain)
+- [ ] All 4 agents configured + tested
+- [ ] Feature flags reviewed (`/admin` → Flags): pdfUpload / ocr / sttNative / webPush / autoAppendTotals / defaultLanguage / replyDelayMs
+- [ ] Context settings reviewed (`/admin` → Context): LLM vs RAG mode, txn window, chat history window
+- [ ] End-to-end smoke: create user → set MPIN → log a txn → ask a balance question → set a reminder
 
 ---
 
 ## Architecture notes
 
-### Why dual LLM protocol (OpenAI-compatible + Anthropic)?
+### Reminders pipeline (QStash, Vercel-free friendly)
 
-The user (developer) wants full control over which model powers each agent. Per-agent config means:
-- Daily chat can use Groq llama-3.3-70b (cheap, fast, native tool-calling)
-- Dashboard analysis can use OpenAI gpt-4o (expensive, strongest reasoning, vision-capable)
-- STT can use native Web Speech API (free) or Groq + Whisper-style endpoint
-- OCR uses whatever vision-capable model admin picks (OpenAI gpt-4o / Anthropic Sonnet / Gemini)
+Reminder rows are calendar-shaped (`type/time/date/daysOfWeek/dayOfMonth`, all IST) with a
+precomputed `nextRunAt` UTC timestamp. Delivery has two independent paths:
 
-The Anthropic-native API differs enough from OpenAI's that a thin shim is needed (different message
-format, different tool-call envelope, `max_tokens` is required not optional). The client handles both.
+1. **Exact-time** — `src/lib/scheduler.ts` converts IST → UTC cron (India is UTC+5:30 year-round,
+   so the math is deterministic) and registers a per-reminder QStash schedule; one-timers within
+   6 days use QStash delayed publish.
+2. **Catch-all poll** — a single `*/5` QStash cron fires every row where `nextRunAt <= now`,
+   then advances `nextRunAt` (or deactivates one-timers). Legacy cron-string rows are migrated lazily.
 
-Models without native function-calling (Gemma and friends) get a JSON fallback mode: the agent
-config's "tool calling supported" toggle is flipped OFF, the model is instructed to emit
-`{"tool_call":{"name":"...","arguments":{...}}}` inline, and the `parseJsonToolCalls` helper
-(in `src/lib/llm/json-tool-parser.ts`) strips markdown fences, scans for balanced `{...}` objects,
-parses each, and accumulates multiple tool calls. Handles nested args (e.g., `propose_mindmap_edit`
-with `nodes:[{...},{...}]` arrays) correctly.
+The endpoint authenticates via Upstash server signatures (JWT HS256, Web Crypto — no extra
+dependency) or the bearer token, and falls back to open only when no auth env vars exist (local dev).
 
-### Why Neon (vs Supabase / Turso)?
+### Import pipeline
 
-- **Neon**: serverless Postgres with branching, generous free tier (0.5 GB), built-in pooling.
-- **Supabase**: also fine, but adds an opinionated auth + storage layer (we already have our own).
-- **Turso**: SQLite at the edge — tempting, but no real Postgres features (CTEs, JSONB operators) we might want later.
+`public/addingaccountsprompt.md` is a complete system prompt for ANY external chatbot: it
+interviews the user (accounts → wallets → demat → contacts → categories), explicitly offers to
+read CSV data, enforces plain-number INR + sign conventions, and emits one fenced markdown block
+(or JSON). `src/lib/agent/import-parser.ts` auto-detects JSON / markdown tables / CSV, normalizes
+types and money strings, then `detectConflicts()` diffs against existing entities. The dashboard
+dialog previews everything, lets the user pick keep-mine / use-imported per conflict, and applies.
 
 ### Session model
-
-Three separate session cookies, three separate timeouts:
 
 | Cookie | TTL | Idle? | Notes |
 |---|---|---|---|
@@ -275,76 +253,49 @@ Three separate session cookies, three separate timeouts:
 | `dashboard_session` | 4 hours hard cap | **15 min idle** (any activity extends) | Re-entry required; protects sensitive aggregates |
 | `admin_session` | 2 hours | No | Env-var auth; short for security |
 
-The dashboard's idle timeout is enforced server-side (each request checks `lastActivity`); any
-activity (API call, page nav) extends it. So an active analyst won't get kicked out, but a parked
-tab will after 15 minutes.
+### Tool-call reliability (no JSON leaks)
 
-### Liquid schema
+Three layers: (1) native tool-calling when supported; (2) a hardened inline-JSON fallback parser
+(balanced-brace scan, fence stripping, trailing-comma repair, snake_case name heuristic so chart
+JSON is never swallowed); (3) `sanitizeAssistantText()` strips any leaked tool-call object from
+EVERY persisted/displayed assistant message. Chart markers are extracted server-side and ride in
+message metadata — the bubble only ever shows clean markdown.
 
-The agent can create accounts / contacts / categories mid-conversation. The Prisma schema has a
-`metadata String @default("{}")` on every major entity for ad-hoc custom fields (e.g., `rawText`
-from bank statement uploads, `eventType` for non-financial events, `deviceType` for WebAuthn creds).
-Admins can edit the system prompts to teach the agent new patterns without code changes.
+### Infinite context, pragmatically
 
-### Multi-leg transaction groups
+Per call: system prompt (time + live balances + schema + recent txns) + last N chat messages
+(admin-tunable). Beyond that: `search_chat_history` (keyword search over every stored message),
+`retrieve_transactions` (semantic-ish scoring), `query_transactions`/`aggregate` (structured
+filters with computed from/to dates). The UI paginates history 100 messages at a time on scroll-up.
 
-A single user message can produce multiple `log_expense` / `log_income` / `mark_event` tool calls
-that share a `group_label`. The agent loop auto-links any txns created in the same turn (even if
-the LLM forgets `group_label` on some legs) by scanning the result strings for `Txn ID: xxx` and
-linking them to the first-seen group. The dashboard agent can then call `get_group_summary(label)`
-to answer "tell me about Shorya's IPO plan" with a structured breakdown.
-
-### Mindmap agentic edit flow
-
-1. User opens `/dashboard` → Mindmap Editor → selects a mindmap.
-2. User types a request in the chat panel: "reorganize my budget mindmap with income and expenses as children of a root node".
-3. UI posts to `/api/dashboard/deep-dive` with the current nodes/edges as context.
-4. Agent calls `propose_mindmap_edit(id, nodes, edges, summary)` — full proposed graph (not a patch).
-5. The tool returns the proposed graph as JSON. UI parses it and shows a **review panel**:
-   "Agent proposed: 'Reorganized with root node'. [Apply] [Discard]".
-6. Clicking **Apply** copies the proposal to the canvas — but does NOT save.
-7. Undo/redo work on the canvas state (snapshots of `{nodes, edges}`).
-8. **Save** commits the full current state (PUT replace).
-
-This matches the user's explicit requirement: "explicit save, with undo/redo".
-
-### Chart-on-demand
-
-The dashboard agent is instructed (via system prompt) to emit a `[CHART:{...}]` marker AFTER
-its textual reply when a chart would help. The `/api/dashboard/deep-dive` endpoint parses the
-marker with a balanced-brace scanner (handles nested JSON like `data:[{label, value}]`) and
-returns `{ reply, chartSpec, toolCalls }`. The UI shows the text reply, then a `<details>`
-with "📊 Show as chart" reveal button — text first, chart on demand.
-
----
-
-## File map
+### File map
 
 ```
-prisma/schema.prisma                — 15 models, SQLite+Postgres compatible
-scripts/seed.ts                     — Default admin config (4 agents + flags + glossary)
+prisma/schema.prisma                — models (liquid metadata on entities, structured reminders, user prefs)
+scripts/seed.ts                     — default admin config (4 agents + flags + glossary + uxConfig)
 scripts/gen-vapid.ts                — VAPID keypair generator
-scripts/hash-password.ts           — bcrypt password hasher
-scripts/e2e-verify.sh              — End-to-end API smoke test (login → MPIN → chat → dashboard)
-scripts/test-phase3.sh             — End-to-end smoke test for Phase 3
-src/lib/admin-config.ts            — Admin config DB accessors (cached 5 min)
-src/lib/llm/client.ts              — Universal LLM client (3 providers)
-src/lib/llm/presets.ts              — Curated model presets (chips in admin)
-src/lib/llm/json-tool-parser.ts    — Robust JSON tool-call extractor (fallback mode)
-src/lib/agent/loop.ts               — Conversation loop (max 5 tool-call iterations)
-src/lib/agent/tools.ts             — 18 tool implementations
-src/lib/agent/tools-defs.ts        — Tool JSON Schema definitions
-src/lib/agent/prompt-builder.ts    — System prompt assembly (time + schema + flags + glossary)
-src/lib/auth/credentials.ts         — bcrypt MPIN + password wrappers
-src/lib/auth/session.ts            — 3 session types (daily / dashboard / admin)
-src/lib/auth/webauthn.ts           — @simplewebauthn/server wrappers
-src/lib/notifications/push.ts      — Web Push (VAPID) + placeholder templates
-src/app/                           — Next.js App Router pages + API routes
-src/components/dashboard/          — DeepDiveChat, MultiPeriodChart
-src/components/mindmap/            — MindmapEditor (React Flow)
-src/components/charts/             — InlineChart (Recharts bar/line/pie)
+scripts/gen-icons.ts                — PNG PWA icon generator (sharp)
+scripts/hash-password.ts            — bcrypt password hasher
+public/addingaccountsprompt.md      — system prompt for external AI chatbots (import flow)
+src/lib/admin-config.ts             — admin config accessors (cached 30s) + types
+src/lib/llm/client.ts               — universal LLM client (OpenAI-compatible + Anthropic)
+src/lib/llm/json-tool-parser.ts     — hardened tool-call extractor + reply sanitizer
+src/lib/agent/loop.ts               — conversation loop (dedupe, sanitize, chartSpec persistence)
+src/lib/agent/tools.ts              — tool implementations (+ search_chat_history)
+src/lib/agent/tools-defs.ts         — tool JSON schemas (daily agent = full analytical kit)
+src/lib/agent/prompt-builder.ts     — system prompt assembly (time + balances + date rules + chart powers)
+src/lib/agent/chart-marker.ts       — shared [CHART:{...}] extractor
+src/lib/agent/import-parser.ts      — JSON/markdown/CSV import parser + conflict detection
+src/lib/scheduler.ts                — calendar reminders: IST→UTC math, nextRunAt, QStash REST client
+src/lib/notifications/push.ts       — Web Push (VAPID) + message templates
+src/app/api/chat/route.ts           — daily+dashboard chat, history pagination
+src/app/api/dashboard/import/       — two-phase import (preview → apply)
+src/app/api/notifications/cron/     — QStash delivery endpoint (signatures verified)
+src/components/chat/Markdown.tsx    — chat markdown renderer
+src/components/dashboard/           — DeepDiveChat, MultiPeriodChart, ImportDialog
+src/components/mindmap/             — MindmapEditor (React Flow)
 ```
 
 ## License
 
-Private project. Not for redistribution.
+Private project. Not for redistribution. Made with ❤️ by [Naman](https://github.com/NamanSoni78).

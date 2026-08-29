@@ -81,6 +81,13 @@ export interface SchemaMode {
   mode: "llm" | "rag";
   lastNTxns: number;
   refreshEveryCall: boolean;
+  /** How many recent chat messages are fed to the LLM each call (older turns stay reachable via search_chat_history). Default 24. */
+  chatHistoryLimit?: number;
+}
+
+export interface UxConfig {
+  /** Artificial minimum delay (ms) before a chat reply is returned — useful to make typing indicators feel natural. 0 = disabled. */
+  replyDelayMs?: number;
 }
 
 export interface GlossaryEntry {
@@ -105,6 +112,9 @@ export async function getFeatureFlags(): Promise<FeatureFlags> {
 }
 export async function getSchemaMode(): Promise<SchemaMode> {
   return getAdminConfig<SchemaMode>("schemaMode");
+}
+export async function getUxConfig(): Promise<UxConfig> {
+  return getAdminConfig<UxConfig>("uxConfig", {});
 }
 export async function getGlossary(): Promise<GlossaryEntry[]> {
   return getAdminConfig<GlossaryEntry[]>("glossary", []);

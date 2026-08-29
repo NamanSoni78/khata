@@ -1,0 +1,284 @@
+// Finance Tracker PWA — Prisma schema
+// Portable: works on SQLite (sandbox/dev) AND Neon Postgres (production).
+// To switch to Postgres: change provider to "postgresql" and set DATABASE_URL.
+// All JSON-ish columns use String + JSON.stringify/parse to stay SQLite-friendly.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+//  CORE: USERS & AUTH
+// ============================================================
+
+model User {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  mpin                  UserMpin?
+  webauthnCreds         UserWebAuthnCredential[]
+  sessions              UserSession[]
+  accounts              Account[]
+  contacts              Contact[]
+  categories            Category[]
+  tags                  Tag[]
+  transactions          Transaction[]
+  transactionGroups     TransactionGroup[]
+  pendingQuestions      PendingQuestion[]
+  chatMessages          ChatMessage[]
+  pushSubscriptions     PushSubscription[]
+  scheduledNotifications ScheduledNotification[]
+  mindmaps              Mindmap[]
+
+  @@index([username])
+}
+
+model UserMpin {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  mpinHash  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model UserWebAuthnCredential {
+  id           String   @id @default(cuid())
+  userId       String
+  credentialId String   @unique // base64url
+  publicKey    String   // base64
+  counter      Int
+  transports    String   @default("[]") // JSON array
+  deviceType    String?
+  createdAt     DateTime @default(now())
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model UserSession {
+  id              String   @id @default(cuid())
+  userId          String
+  type            String   // 'daily' | 'dashboard' | 'admin'
+  token           String   @unique // random session token (cookie value)
+  expiresAt       DateTime
+  lastActivityAt  DateTime @default(now())
+  createdAt       DateTime @default(now())
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([token])
+}
+
+// ============================================================
+//  FINANCIAL ENTITIES — all have `metadata` String(JSON) for liquid schema
+// ============================================================
+
+model Account {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String   // e.g. "SBI Savings", "Angle One Demat", "Cash Wallet"
+  type        String   // 'bank' | 'demat' | 'wallet' | 'cash' | 'investment' | 'other'
+  institution String?  // e.g. "SBI", "Angle One", "HDFC"
+  balance     Float    @default(0)
+  currency    String   @default("INR")
+  metadata    String   @default("{}") // agent can attach any custom fields (branch_code, account_number_last4, etc.)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  txnsFrom Transaction[] @relation("TxnFromAccount")
+  txnsTo   Transaction[] @relation("TxnToAccount")
+
+  @@index([userId, type])
+  @@index([userId, isActive])
+}
+
+model Contact {
+  id           String   @id @default(cuid())
+  userId       String
+  name         String   // e.g. "Shorya"
+  type         String   // 'friend' | 'family' | 'colleague' | 'merchant' | 'other'
+  relationship String?
+  balance      Float    @default(0) // running balance: +ve = they owe me, -ve = I owe them
+  metadata     String   @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  transactions Transaction[] @relation("TxnContact")
+
+  @@index([userId])
+}
+
+model Category {
+  id       String   @id @default(cuid())
+  userId   String
+  name     String   // e.g. "Transport", "Food", "IPO Investment"
+  type     String   // 'expense' | 'income' | 'transfer' | 'investment' | 'loan'
+  parentId String?
+  icon     String?
+  metadata String   @default("{}")
+  createdAt DateTime @default(now())
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent   Category?  @relation("CategoryParent", fields: [parentId], references: [id], onDelete: SetNull)
+  children Category[] @relation("CategoryParent")
+  transactions Transaction[]
+
+  @@index([userId, type])
+}
+
+model Tag {
+  id        String   @id @default(cuid())
+  userId    String
+  name      String
+  color     String?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions TransactionTag[]
+
+  @@unique([userId, name])
+}
+
+model TransactionTag {
+  transactionId String
+  tagId         String
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  tag           Tag         @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([transactionId, tagId])
+}
+
+model Transaction {
+  id            String   @id @default(cuid())
+  userId        String
+  type          String   // 'expense' | 'income' | 'transfer' | 'investment' | 'loan_out' | 'loan_in' | 'profit' | 'loss' | 'fee'
+  amount        Float
+  fromAccountId String?
+  toAccountId   String?
+  contactId     String?
+  categoryId    String?
+  groupId       String?
+  timestamp     DateTime @default(now()) // when transaction actually occurred
+  notes         String?
+  metadata      String   @default("{}") // agent can stash any custom fields
+  source        String   @default("manual") // 'chat' | 'statement' | 'admin' | 'agent_inferred'
+  status        String   @default("confirmed") // 'pending' | 'confirmed' | 'rejected'
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user         User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fromAccount  Account?           @relation("TxnFromAccount", fields: [fromAccountId], references: [id], onDelete: SetNull)
+  toAccount    Account?           @relation("TxnToAccount", fields: [toAccountId], references: [id], onDelete: SetNull)
+  contact      Contact?           @relation("TxnContact", fields: [contactId], references: [id], onDelete: SetNull)
+  category     Category?          @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  group        TransactionGroup?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  tags         TransactionTag[]
+
+  @@index([userId, timestamp])
+  @@index([userId, type])
+  @@index([groupId])
+  @@index([userId, status])
+}
+
+model TransactionGroup {
+  id          String   @id @default(cuid())
+  userId      String
+  label       String   // e.g. "Shorya SBI IPO plan"
+  description String?
+  metadata    String   @default("{}")
+  createdAt   DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+
+  @@index([userId])
+}
+
+// When AI needs more info before committing a transaction
+model PendingQuestion {
+  id         String   @id @default(cuid())
+  userId     String
+  question   String
+  context    String   @default("{}") // JSON: what was the original txn + what was ambiguous
+  status     String   @default("open") // 'open' | 'resolved' | 'dismissed'
+  createdAt  DateTime @default(now())
+  resolvedAt DateTime?
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+}
+
+model ChatMessage {
+  id        String   @id @default(cuid())
+  userId    String
+  role      String   // 'user' | 'assistant' | 'system' | 'tool'
+  content   String
+  metadata  String   @default("{}") // tool calls, tool results, tokens used, model name
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String
+  keys      String   // JSON: { p256dh, auth }
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model ScheduledNotification {
+  id          String   @id @default(cuid())
+  userId      String
+  schedule    String   // cron expr OR ISO timestamp for one-time
+  message     String
+  template    String?  // optional template with placeholders
+  lastFiredAt DateTime?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isActive])
+}
+
+// ============================================================
+//  MINDMAPS — user-saved React Flow diagrams (manual + agentic edits)
+// ============================================================
+
+model Mindmap {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  nodes       String   @default("[]") // JSON array of React Flow nodes
+  edges       String   @default("[]") // JSON array of React Flow edges
+  metadata    String   @default("{}") // e.g. { lastEditedBy: 'agent' | 'user' }
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, updatedAt])
+}
+
+// ============================================================
+//  ADMIN CONFIG — flexible key/value store for all admin-set values
+// ============================================================
+
+model AdminConfig {
+  key       String   @id
+  value     String   // JSON string
+  updatedAt DateTime @updatedAt
+}

@@ -85,7 +85,7 @@ export default function AdminPanel() {
       const res = await fetch("/api/admin/test-agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(cfg),
+        body: JSON.stringify({ which, ...cfg }),
       });
       const r = await res.json();
       if (r.ok) toast.success(`✓ ${which}: ${r.message}`);

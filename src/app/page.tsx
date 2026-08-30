@@ -20,6 +20,7 @@ export default async function Home() {
     return <DailyApp initialStage="mpin-setup" username={user.username} userId={user.id} />;
   }
 
-  // MPIN or WebAuthn exists — show unlock screen
-  return <DailyApp initialStage="unlock" username={user.username} />;
+  // MPIN or WebAuthn exists — show unlock screen. Passing hasWebauthn lets the
+  // client start the fingerprint flow instantly instead of waiting for /api/auth/me.
+  return <DailyApp initialStage="unlock" username={user.username} hasWebauthn={webauthnCount > 0} />;
 }

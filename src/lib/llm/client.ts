@@ -545,3 +545,50 @@ async function chatCompleteVisionAnthropic(
   }
   return { content: text, toolCalls: [], raw: json };
 }
+
+
+export async function testSttConnection(config: AgentConfig): Promise<{ ok: boolean; message: string }> {
+  try {
+    if (!config.baseUrl) {
+      return { ok: false, message: "No base URL set." };
+    }
+    const rawUrl = config.baseUrl.trim().replace(/\/$/, "");
+    const sttUrl = rawUrl.endsWith("/audio/transcriptions")
+      ? rawUrl
+      : `${rawUrl}/audio/transcriptions`;
+
+    const headers: Record<string, string> = {
+      ...getExtraHeaders(config),
+    };
+    if (config.apiKey) {
+      headers["Authorization"] = `Bearer ${config.apiKey}`;
+    }
+
+    const res = await fetch(sttUrl, {
+      method: "POST",
+      headers,
+    });
+
+    if (res.ok || res.status === 400 || res.status === 422 || res.status === 415) {
+      return {
+        ok: true,
+        message: `Connected to STT endpoint (${sttUrl}). Server responded with HTTP ${res.status}.`,
+      };
+    }
+
+    if (res.status === 401 || res.status === 403) {
+      return {
+        ok: false,
+        message: `Authentication failed (HTTP ${res.status}). Check API key. Endpoint: ${sttUrl}`,
+      };
+    }
+
+    const text = await res.text().catch(() => "");
+    return {
+      ok: false,
+      message: `STT endpoint error HTTP ${res.status}: ${text.slice(0, 100) || res.statusText}`,
+    };
+  } catch (e: any) {
+    return { ok: false, message: e?.message ?? String(e) };
+  }
+}

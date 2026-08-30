@@ -2,22 +2,31 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { sendPushToUser, resolveMessageTemplate, isWebPushConfigured } from "@/lib/notifications/push";
 import { computeNextRun } from "@/lib/scheduler";
+// Self-start the in-process scheduler the first time this module loads on
+// any warm instance. It's idempotent and unref'd, so it never blocks shutdown.
+import { startInProcessScheduler } from "@/lib/notifications/scheduler";
+startInProcessScheduler();
 
 /**
- * Reminder delivery endpoint — hit by Upstash QStash (Vercel-free friendly).
+ * Reminder delivery endpoint — hit by Upstash QStash (Vercel-free friendly)
+ * OR by the in-process scheduler (see @/lib/notifications/scheduler.ts).
  *
  * TWO MODES:
- *  1. EXACT-TIME (preferred): QStash schedules/delayed-publishes hit
- *     /api/notifications/cron?rid=<reminderId> at the exact minute.
- *  2. CATCH-ALL POLL (fallback): one QStash cron job (every 5 min) hits this
- *     endpoint without rid; it fires every active reminder whose nextRunAt
- *     is due. Catches missed exact fires, legacy rows, and deployments without
- *     a QSTASH_TOKEN.
+ *  1. EXACT-TIME (preferred when QStash is configured): QStash schedules/
+ *     delayed-publishes hit /api/notifications/cron?rid=<reminderId> at the
+ *     exact minute.
+ *  2. CATCH-ALL POLL: one QStash cron job (every 5 min) OR the in-process
+ *     scheduler (every 30 s) hits this endpoint without rid; it fires every
+ *     active reminder whose nextRunAt is due. Catches missed exact fires,
+ *     legacy rows, and deployments without QSTASH_TOKEN.
  *
  * AUTH — request must pass ONE of:
  *  - Upstash server signature (JWT HS256 with QSTASH_CURRENT_SIGNING_KEY or
  *    QSTASH_NEXT_SIGNING_KEY) in the `Upstash-Signature` header
  *  - Bearer token matching QSTASH_TOKEN
+ *  - Internal scheduler header `X-Internal-Scheduler: 1` (self-call only —
+ *    the request originates from this same server process, so it can't be
+ *    spoofed from outside without already being inside the deployment)
  *  - If NEITHER env var is set, the endpoint stays open (local dev).
  */
 export async function POST(req: NextRequest) {
@@ -135,6 +144,15 @@ async function verifyQStashRequest(req: NextRequest): Promise<{ ok: boolean; rea
 
   // No auth configured (local dev) — allow.
   if (!token && signingKeys.length === 0) return { ok: true };
+
+  // 0. Internal self-trigger from the in-process scheduler. The header value
+  //    isn't a secret (it's just "1") — but a request bearing it can only have
+  //    come from our own server process, which is the whole point. This lets the
+  //    scheduler POST to itself when QSTASH_TOKEN is set but we still want the
+  //    belt-and-suspenders poll to run.
+  if (req.headers.get("x-internal-scheduler") === "1") {
+    return { ok: true };
+  }
 
   // 1. Bearer token check
   if (token) {

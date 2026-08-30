@@ -246,3 +246,38 @@ input[type="number"]::-webkit-inner-spin-button {
   -webkit-appearance: none;
   margin: 0;
 }
+
+
+/* ============================================================
+   WHATSAPP-STYLE MIC & SOUND WAVE ANIMATIONS
+   ============================================================ */
+@keyframes rec-ripple {
+  0% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6), 0 0 0 0 rgba(239, 68, 68, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(239, 68, 68, 0.3), 0 0 0 16px rgba(239, 68, 68, 0.15);
+  }
+  100% {
+    box-shadow: 0 0 0 14px rgba(239, 68, 68, 0), 0 0 0 24px rgba(239, 68, 68, 0);
+  }
+}
+.anim-whatsapp-mic {
+  animation: rec-ripple 1.5s infinite cubic-bezier(0.215, 0.61, 0.355, 1);
+}
+
+@keyframes sound-wave {
+  0%, 100% { height: 4px; }
+  50% { height: 18px; }
+}
+.sound-wave-bar {
+  width: 3px;
+  background-color: oklch(0.577 0.215 27.32);
+  border-radius: 999px;
+  animation: sound-wave 0.8s ease-in-out infinite;
+}
+.sound-wave-bar:nth-child(1) { animation-delay: 0.0s; }
+.sound-wave-bar:nth-child(2) { animation-delay: 0.15s; }
+.sound-wave-bar:nth-child(3) { animation-delay: 0.3s; }
+.sound-wave-bar:nth-child(4) { animation-delay: 0.45s; }
+.sound-wave-bar:nth-child(5) { animation-delay: 0.2s; }

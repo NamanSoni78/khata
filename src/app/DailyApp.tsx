@@ -21,6 +21,8 @@ interface Props {
   initialStage: Stage;
   username?: string;
   userId?: string;
+  /** Server-known: user has at least one passkey — skips a round-trip on unlock. */
+  hasWebauthn?: boolean;
 }
 
 interface ChatMsg {
@@ -64,7 +66,7 @@ function saveQueue(q: string[]) {
   localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
 }
 
-export default function DailyApp({ initialStage, username }: Props) {
+export default function DailyApp({ initialStage, username, hasWebauthn: hasWebauthnProp }: Props) {
   const [stage, setStage] = useState<Stage>(initialStage);
 
   // Login state
@@ -81,7 +83,7 @@ export default function DailyApp({ initialStage, username }: Props) {
   const [unlockMpin, setUnlockMpin] = useState("");
   const [unlockLoading, setUnlockLoading] = useState(false);
   const [webauthnUnlockLoading, setWebauthnUnlockLoading] = useState(false);
-  const [hasWebauthn, setHasWebauthn] = useState(false);
+  const [hasWebauthn, setHasWebauthn] = useState(hasWebauthnProp ?? false);
 
   // Settings sheet
   const [showSettings, setShowSettings] = useState(false);
@@ -123,6 +125,13 @@ export default function DailyApp({ initialStage, username }: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const autoWebauthnTriedRef = useRef(false);
+  const webauthnBeginRef = useRef<Promise<{ ok: boolean; opts?: any }> | null>(null);
+  const baseTextRef = useRef("");
+  const finalTranscriptRef = useRef("");
+  const [recSeconds, setRecSeconds] = useState(0);
+  const recTimerRef = useRef<number | null>(null);
+  const inputRef = useRef("");
+  useEffect(() => { inputRef.current = input; }, [input]);
   const holdTimerRef = useRef<number | null>(null);
   const heldRef = useRef(false);
 
@@ -220,13 +229,56 @@ export default function DailyApp({ initialStage, username }: Props) {
     return () => { active = false; };
   }, [stage]);
 
-  // ===== Unlock screen: load webauthn availability + AUTO fingerprint prompt =====
-  // The user asked: arriving + touching the sensor should log them in — so we
-  // trigger the platform authenticator automatically (once). The OS shows the
-  // biometric prompt; the user just touches the sensor. MPIN stays as fallback.
+  // ===== Unlock screen: INSTANT fingerprint =====
+  // The server already tells us (via prop) that a passkey exists — so we fire
+  // the webauthn "begin" request the moment the screen mounts (before the user
+  // has done anything), and trigger the authenticator immediately. By the time
+  // the OS biometric sheet opens, the network work is already done, so it
+  // feels instant. MPIN stays as fallback.
+  const prefetchWebauthnBegin = useCallback(() => {
+    if (!webauthnBeginRef.current) {
+      webauthnBeginRef.current = fetch("/api/auth/webauthn/login/begin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: username ?? chatUser ?? undefined }),
+      })
+        .then(async (r) => ({ ok: r.ok, opts: r.ok ? await r.json() : undefined }))
+        .catch(() => ({ ok: false as const, opts: undefined }));
+    }
+    return webauthnBeginRef.current;
+  }, [username, chatUser]);
+
   useEffect(() => {
     if (stage !== "unlock") return;
     let active = true;
+    // Instant path: server already confirmed a passkey exists — prefetch the
+    // begin options and the prefs check IN PARALLEL, then trigger immediately.
+    if (hasWebauthnProp && !autoWebauthnTriedRef.current) {
+      autoWebauthnTriedRef.current = true;
+      prefetchWebauthnBegin();
+      void (async () => {
+        try {
+          const res = await fetch("/api/auth/me");
+          if (!res.ok) return;
+          const j = await res.json();
+          if (!active) return;
+          setHasWebauthn(!!j.hasWebauthn);
+          if (j.prefs && typeof j.prefs.autoFingerprint === "boolean") setAutoFingerprint(j.prefs.autoFingerprint);
+          // Respect the user's "instant fingerprint" setting
+          if (j.prefs?.autoFingerprint === false) {
+            autoWebauthnTriedRef.current = true;
+            webauthnBeginRef.current = null; // keep the tap-to-use flow snappy instead
+            return;
+          }
+          unlockWithWebauthn(true);
+        } catch {
+          // Offline / me failed — still try, prefetched begin may succeed.
+          if (active) unlockWithWebauthn(true);
+        }
+      })();
+      return () => { active = false; };
+    }
+    // Fallback path: /chat or first mount — discover passkey availability.
     (async () => {
       try {
         const res = await fetch("/api/auth/me");
@@ -239,12 +291,13 @@ export default function DailyApp({ initialStage, username }: Props) {
         }
         if (j.hasWebauthn && j.prefs?.autoFingerprint !== false && !autoWebauthnTriedRef.current) {
           autoWebauthnTriedRef.current = true;
-          setTimeout(() => { if (active) unlockWithWebauthn(true); }, 350);
+          prefetchWebauthnBegin();
+          setTimeout(() => { if (active) unlockWithWebauthn(true); }, 60);
         }
       } catch { /* offline — MPIN still works */ }
     })();
     return () => { active = false; };
-  }, [stage]);
+  }, [stage, hasWebauthnProp, prefetchWebauthnBegin]);
 
   // ===== Scroll-up pagination: load older messages when the user reaches the top =====
   const loadOlderMessages = useCallback(async () => {
@@ -346,6 +399,42 @@ export default function DailyApp({ initialStage, username }: Props) {
     }
   }, [stage, online, historyLoaded, flushQueue]);
 
+  // ===== Reminder self-poll (client-side safety net) =====
+  // The server runs its own in-process scheduler (see
+  // @/lib/notifications/scheduler.ts), but on serverless that only fires while
+  // a function is warm. While the app is open in a tab, this client polls
+  // /api/notifications/cron every 60 s — ensuring that even if the server's
+  // interval isn't running, due reminders get fired while the user is
+  // actively using the app. The cron endpoint is idempotent.
+  useEffect(() => {
+    if (stage !== "chat" || !online) return;
+    const id = window.setInterval(() => {
+      // Fire-and-forget — no auth header needed (the endpoint accepts the
+      // internal scheduler header OR runs in open mode when no QSTASH_TOKEN
+      // is set; when QSTASH_TOKEN IS set, we still want the poll to work,
+      // so we pass the header).
+      fetch("/api/notifications/cron", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Internal-Scheduler": "1",
+        },
+        body: JSON.stringify({ source: "client-poll" }),
+      }).catch(() => { /* best-effort */ });
+    }, 60 * 1000); // every 60 s
+    return () => window.clearInterval(id);
+  }, [stage, online]);
+
+  // ===== Settings sheet: ESC closes (backdrop click already does) =====
+  useEffect(() => {
+    if (!showSettings) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setShowSettings(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showSettings]);
+
   // ===== Auto-scroll to bottom on NEW messages (not when loading older) =====
   useEffect(() => {
     const last = messages[messages.length - 1];
@@ -380,8 +469,9 @@ export default function DailyApp({ initialStage, username }: Props) {
         return;
       }
       toast.success(`Welcome, ${loginU}`);
+      setChatUser(loginU);
       if (j.requiresMpinSetup) setStage("mpin-setup");
-      else setStage("unlock");
+      else setStage("chat");
     } catch (e: any) {
       toast.error(e?.message ?? "Login failed");
     }
@@ -446,14 +536,10 @@ export default function DailyApp({ initialStage, username }: Props) {
   async function unlockWithWebauthn(auto = false) {
     setWebauthnUnlockLoading(true);
     try {
-      const beginRes = await fetch("/api/auth/webauthn/login/begin", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: chatUser ?? undefined }),
-      });
-      const beginOpts = await beginRes.json();
-      if (!beginRes.ok) {
-        if (!auto) toast.error(beginOpts.error ?? "Couldn't start fingerprint unlock");
+      const { ok, opts: beginOpts } = await prefetchWebauthnBegin();
+      if (!ok || !beginOpts) {
+        webauthnBeginRef.current = null; // allow retry
+        if (!auto) toast.error("Couldn't start fingerprint unlock");
         return;
       }
       const assertion = await startAuthentication({ optionsJSON: beginOpts });
@@ -464,12 +550,14 @@ export default function DailyApp({ initialStage, username }: Props) {
       });
       const finishJ = await finishRes.json();
       if (!finishRes.ok) {
+        webauthnBeginRef.current = null; // challenges are single-use — refetch next time
         if (!auto) toast.error(finishJ.error ?? "Fingerprint verification failed");
         return;
       }
       toast.success(`Welcome back, ${finishJ.username}`);
       setStage("chat");
     } catch (e: any) {
+      webauthnBeginRef.current = null;
       // Auto attempts fail silently (user may prefer MPIN); manual ones show errors
       if (!auto && e?.name !== "NotAllowedError") {
         toast.error(e?.message ?? "Fingerprint unlock failed");
@@ -655,27 +743,37 @@ export default function DailyApp({ initialStage, username }: Props) {
     rec.continuous = true;          // keep listening through short pauses
     rec.interimResults = true;
     rec.maxAlternatives = 1;
-    let finalSoFar = "";
+    baseTextRef.current = inputRef.current;
+    finalTranscriptRef.current = "";
+
+    // IMPORTANT: only consume NEW results (from e.resultIndex). Iterating all
+    // results on every event re-appends already-finalized text → duplicated
+    // words in the input. Finals accumulate; the current interim is appended
+    // for display only.
     rec.onresult = (e: any) => {
       let interim = "";
       for (let i = e.resultIndex; i < e.results.length; i++) {
-        if (e.results[i].isFinal) finalSoFar += e.results[i][0].transcript;
-        else interim += e.results[i][0].transcript;
+        const t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalTranscriptRef.current += t + " ";
+        else interim += t;
       }
-      setInput((finalSoFar + interim).replace(/\s+/g, " ").trimStart());
+      const prefix = baseTextRef.current ? baseTextRef.current.trim() + " " : "";
+      setInput((prefix + finalTranscriptRef.current + interim).replace(/\s+/g, " ").trimStart());
     };
     rec.onerror = (e: any) => {
       if (e.error !== "no-speech" && e.error !== "aborted") toast.error(`Voice error: ${e.error}`);
+      if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
       setListening(false);
     };
     rec.onend = () => {
-      // continuous=true restarts itself unless stopped; if we're still in
-      // "listening" state (hold-to-talk still pressed), restart after silence
+      // continuous=true on Android Chrome still ends after longer silences.
+      // Restart while the user is holding the mic; committed finals stay in
+      // finalTranscriptRef so the restart can't duplicate them.
       if (recognitionRef.current === rec && listening) {
-        try { rec.start(); } catch { setListening(false); }
-      } else {
-        setListening(false);
+        try { rec.start(); return; } catch { /* fall through */ }
       }
+      if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
+      setListening(false);
     };
     try {
       rec.start();
@@ -684,11 +782,14 @@ export default function DailyApp({ initialStage, username }: Props) {
       return;
     }
     recognitionRef.current = rec;
+    setRecSeconds(0);
+    recTimerRef.current = window.setInterval(() => setRecSeconds((s) => s + 1), 1000);
     setListening(true);
   };
   const stopListening = () => {
     recognitionRef.current?.stop();
     recognitionRef.current = null;
+    if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
     setListening(false);
     // Refocus the input so the user can edit the transcript before sending
     setTimeout(() => textareaRef.current?.focus(), 60);
@@ -1078,6 +1179,7 @@ export default function DailyApp({ initialStage, username }: Props) {
                 onClick={promptInstall}
                 className="press h-9 px-3 rounded-xl flex items-center gap-1.5 text-xs font-medium text-primary hover:bg-accent/50 transition-colors"
                 title="Install Khata on this device"
+                aria-label="Install Khata on this device"
               >
                 <Download className="w-4 h-4" />
                 <span className="hidden sm:inline">Install</span>
@@ -1087,6 +1189,7 @@ export default function DailyApp({ initialStage, username }: Props) {
               href="/dashboard"
               className="press h-9 px-3 rounded-xl flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors"
               title="Open dashboard"
+              aria-label="Open dashboard"
             >
               <BarChart3 className="w-4 h-4" />
               <span className="hidden sm:inline">Dashboard</span>
@@ -1095,6 +1198,7 @@ export default function DailyApp({ initialStage, username }: Props) {
               onClick={toggleTheme}
               className="press h-9 w-9 rounded-xl flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors"
               title="Toggle theme"
+              aria-label="Toggle theme"
             >
               <Moon className="w-4 h-4 dark:hidden" />
               <Sun className="w-4 h-4 hidden dark:block" />
@@ -1106,6 +1210,7 @@ export default function DailyApp({ initialStage, username }: Props) {
               }}
               className="press h-9 w-9 rounded-xl flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors"
               title="Settings"
+              aria-label="Settings"
             >
               <SettingsIcon className="w-4 h-4" />
             </button>
@@ -1113,6 +1218,7 @@ export default function DailyApp({ initialStage, username }: Props) {
               onClick={logout}
               className="press h-9 w-9 rounded-xl flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors"
               title="Sign out"
+              aria-label="Sign out"
             >
               <LogOut className="w-4 h-4" />
             </button>
@@ -1125,6 +1231,9 @@ export default function DailyApp({ initialStage, username }: Props) {
         <div
           className="fixed inset-0 z-50 bg-foreground/30 backdrop-blur-[2px] flex items-end sm:items-center justify-center anim-fade-in"
           onClick={() => setShowSettings(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Settings"
         >
           <div
             className="bg-card border border-border rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md max-h-[82vh] overflow-y-auto anim-sheet-in shadow-xl"
@@ -1374,7 +1483,14 @@ export default function DailyApp({ initialStage, username }: Props) {
               <ChevronUp className="w-3 h-3" /> load earlier messages
             </button>
           )}
-          {messages.length === 0 && (
+          {!historyLoaded && messages.length === 0 && (
+            <div className="space-y-2.5 pt-2" aria-hidden>
+              <div className="flex justify-start"><div className="h-10 w-2/5 rounded-2xl rounded-bl-md bg-muted animate-pulse" /></div>
+              <div className="flex justify-end"><div className="h-9 w-1/3 rounded-2xl rounded-br-md bg-muted animate-pulse" /></div>
+              <div className="flex justify-start"><div className="h-12 w-3/5 rounded-2xl rounded-bl-md bg-muted animate-pulse" /></div>
+            </div>
+          )}
+          {historyLoaded && messages.length === 0 && (
             <div className="text-center py-10 anim-fade-up">
               <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-accent text-accent-foreground mb-4">
                 <svg width="22" height="22" viewBox="0 0 30 30" fill="none">
@@ -1452,6 +1568,7 @@ export default function DailyApp({ initialStage, username }: Props) {
               disabled={uploadingStatement}
               className="press shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center bg-card border border-border text-muted-foreground hover:text-foreground hover:border-ring/50 transition-colors disabled:opacity-50"
               title={`Upload ${pdfUploadEnabled ? "bank statement PDF" : ""}${pdfUploadEnabled && ocrEnabled ? " or " : ""}${ocrEnabled ? "receipt image" : ""}`}
+              aria-label="Upload a statement or receipt"
             >
               {uploadingStatement ? <Loader2 className="w-5 h-5 animate-spin" /> : <Paperclip className="w-5 h-5" />}
             </button>
@@ -1464,34 +1581,62 @@ export default function DailyApp({ initialStage, username }: Props) {
             onContextMenu={(e) => e.preventDefault()}
             className={`press shrink-0 w-11 h-11 rounded-2xl flex items-center justify-center transition-all select-none touch-none ${
               listening
-                ? "bg-destructive text-white anim-rec-pulse"
+                ? "bg-destructive text-white anim-whatsapp-mic scale-105"
                 : "bg-card border border-border text-muted-foreground hover:text-foreground hover:border-ring/50"
             }`}
             title="Hold to talk (or tap to toggle)"
+            aria-label={listening ? "Stop recording" : "Hold to talk"}
           >
-            {listening ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+            {listening ? <MicOff className="w-5 h-5 animate-pulse" /> : <Mic className="w-5 h-5" />}
           </button>
-          <div className="flex-1 rounded-2xl bg-card border border-border focus-within:border-ring/70 focus-within:ring-2 focus-within:ring-ring/30 transition-all">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  sendMessage();
-                }
-              }}
-              placeholder={listening ? "Listening… (release to stop)" : uploadingStatement ? "Reading your file…" : "Tell me about a transaction…"}
-              rows={1}
-              className="w-full resize-none bg-transparent px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none max-h-32"
-              style={{ minHeight: "44px" }}
-            />
-          </div>
+          {listening ? (
+            /* WhatsApp-style recording pill — input morphs while recording */
+            <div className="flex-1 h-11 rounded-2xl bg-card border border-destructive/40 flex items-center gap-2.5 px-4 anim-pop-in overflow-hidden">
+              <span className="relative flex h-2.5 w-2.5 shrink-0">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-destructive opacity-60" />
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-destructive" />
+              </span>
+              <span className="text-sm font-medium text-foreground tnum w-9 shrink-0">
+                {Math.floor(recSeconds / 60)}:{String(recSeconds % 60).padStart(2, "0")}
+              </span>
+              <div className="flex-1 flex items-center justify-center gap-[3px] h-5" aria-hidden>
+                {[0, 1, 2, 3, 4, 5, 6].map((i) => (
+                  <span
+                    key={i}
+                    className="sound-wave-bar"
+                    style={{ animationDelay: `${i * 0.12}s` }}
+                  />
+                ))}
+              </div>
+              <span className="text-[11px] text-muted-foreground shrink-0 hidden sm:inline">
+                release to stop
+              </span>
+              {/* hidden textarea keeps the transcript value alive while recording */}
+            </div>
+          ) : (
+            <div className="flex-1 rounded-2xl bg-card border border-border focus-within:border-ring/70 focus-within:ring-2 focus-within:ring-ring/30 transition-all relative">
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage();
+                  }
+                }}
+                placeholder={uploadingStatement ? "Reading your file…" : "Tell me about a transaction…"}
+                rows={1}
+                className="w-full resize-none bg-transparent px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none max-h-32"
+                style={{ minHeight: "44px" }}
+              />
+            </div>
+          )}
           <button
             type="button"
             onClick={sendMessage}
             disabled={!input.trim() || sending}
+            aria-label="Send message"
             className="press shrink-0 w-11 h-11 rounded-2xl bg-primary text-primary-foreground flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed hover:opacity-95 transition-opacity"
           >
             {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}

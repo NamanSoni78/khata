@@ -3,7 +3,7 @@
 // - Listens for push events (Phase 3 will activate the displayNotification)
 // - Listens for "sync" event (Phase 3 will flush queued messages via Background Sync API)
 
-const CACHE_NAME = "khata-v3";
+const CACHE_NAME = "khata-v4";
 const APP_SHELL = [
   "/",
   "/manifest.json",
@@ -40,16 +40,20 @@ self.addEventListener("fetch", (e) => {
     return;
   }
   if (url.pathname === "/" || url.pathname === "/dashboard" || url.pathname === "/admin") {
-    // Stale-while-revalidate for app shell
+    // Network-first for HTML: the page is server-rendered with the user's auth
+    // stage (login / unlock / chat), so a stale cached page can show the login
+    // screen even when the session cookie is valid. Cache is only an offline fallback.
     e.respondWith(
       (async () => {
-        const cached = await caches.match(e.request);
-        const fetchPromise = fetch(e.request).then((res) => {
+        try {
+          const res = await fetch(e.request);
           const clone = res.clone();
           caches.open(CACHE_NAME).then((c) => c.put(e.request, clone));
           return res;
-        }).catch(() => cached);
-        return cached || fetchPromise;
+        } catch {
+          const cached = await caches.match(e.request);
+          return cached || Response.error();
+        }
       })()
     );
     return;

@@ -10,6 +10,18 @@
  *   - publicKey: base64 (DER-encoded SubjectPublicKeyInfo)
  *   - counter: int (anti-replay)
  *   - transports: JSON array (internal, hybrid, usb, ble, nfc)
+ *
+ * INSTANT FINGERPRINT (vs. slow Google Password Manager sync):
+ *   - Registration uses authenticatorAttachment: 'platform' so the browser
+ *     ONLY offers the device's built-in biometric (Touch ID / Windows Hello /
+ *     Android fingerprint) — NOT roaming authenticators like Google Password
+ *     Manager or 1Password, which add a sync round-trip and a UI picker.
+ *   - userVerification is set to 'required' on both registration AND login.
+ *     This forces the authenticator to perform user verification (biometric)
+ *     every time — 'preferred' lets the authenticator skip it, which on some
+ *     platforms means a slow "pick an account → then verify" flow.
+ *   - hints: ['client-device'] nudges the browser toward the platform
+ *     authenticator even when it would otherwise default to a hybrid one.
  */
 
 import {
@@ -61,11 +73,25 @@ export async function beginRegistration(userId: string, username: string, req: R
       })(),
     })),
     authenticatorSelection: {
+      // PLATFORM = built-in biometric only (Touch ID / Windows Hello / Android
+      // fingerprint). This is what makes unlock instant — the browser skips the
+      // "which passkey?" account picker that Google Password Manager / 1Password
+      // show, and skips the cross-device sync round-trip.
+      authenticatorAttachment: "platform",
       residentKey: "preferred",
-      userVerification: "preferred",
+      // REQUIRED = the authenticator MUST verify the user (biometric). With
+      // "preferred" some authenticators skip UV and just return a credential,
+      // which then makes login prompt for an account → slower.
+      userVerification: "required",
     },
-    supportedAlgorithmIDs: [-7, -257], // ES256 + RS256
-  });
+    // Hint the browser to prefer the client device's platform authenticator.
+    // supportedAlgorithmIDs: ES256 + RS256 (default).
+    supportedAlgorithmIDs: [-7, -257],
+  } as any); // `hints` is supported by @simplewebauthn/server >= 13; cast to any
+  // to avoid a TS error on older type definitions.
+  try {
+    (options as any).hints = ["client-device"];
+  } catch { /* older versions ignore */ }
 
   // Store the challenge in-memory keyed by userId + challenge (simple — for prod use DB or signed token)
   // For Phase 2: store in globalThis cache (works in serverless for ~seconds)
@@ -162,8 +188,16 @@ export async function beginLogin(username: string | undefined, req: Request) {
   const options = await generateAuthenticationOptions({
     rpID,
     allowCredentials,
-    userVerification: "preferred",
-  });
+    // REQUIRED on login too — every auth must touch the biometric sensor.
+    // This is the single biggest speed-up: with "preferred", some authenticators
+    // (esp. Google Password Manager) return a credential silently using a cached
+    // consent, then show the slow account picker; with "required" they always
+    // go straight to the platform biometric.
+    userVerification: "required",
+  } as any);
+  try {
+    (options as any).hints = ["client-device"];
+  } catch { /* older versions ignore */ }
 
   if (!globalThis.webauthnChallenges) {
     (globalThis as any).webauthnChallenges = new Map();
@@ -221,7 +255,8 @@ export async function finishLogin(
         try { return JSON.parse(cred.transports) as any[]; } catch { return []; }
       })(),
     },
-    requireUserVerification: false, // relax for dev — set true for prod
+    // REQUIRED on verify too — reject assertions that didn't perform UV.
+    requireUserVerification: true,
   });
 
   if (!verification.verified) {

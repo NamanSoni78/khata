@@ -25,7 +25,41 @@ Bun.serve({
     const url = new URL(req.url);
     if (!url.pathname.endsWith("/chat/completions")) return new Response("nf", { status: 404 });
     const body = await req.json().catch(() => ({}));
-    const sawToolResult = body.messages?.some((m: any) => m.role === "tool");
+    const msgs: any[] = body.messages ?? [];
+    const sawToolResult = msgs.some((m: any) => m.role === "tool");
+    // SILENT_TEST marker: emulate models that emit ONLY a tool call and then
+    // go completely quiet after receiving the results (the production bug
+    // behind "empty reply in chat"). Turn-relative detection: the marker
+    // user-message must be the LAST message (no tool result / nudge after
+    // it yet) — earlier turns' tool history in the same conversation must
+    // not confuse the state machine.
+    const silentUserIdx = msgs.findIndex(
+      (m: any) => m.role === "user" && typeof m.content === "string" && m.content.includes("SILENT_TEST")
+    );
+    const hasSilentTurn = silentUserIdx !== -1;
+    const isSilentFirst = hasSilentTurn && silentUserIdx === msgs.length - 1;
+    if (isSilentFirst) {
+      return Response.json({
+        choices: [{
+          message: {
+            content: "",
+            tool_calls: [{
+              id: "call_silent_1",
+              type: "function",
+              function: {
+                name: "logExpense",
+                arguments: "{'amount': '50rs', 'category': 'Food', 'notes': 'silent test',}",
+              },
+            }],
+          },
+        }],
+      });
+    }
+    if (hasSilentTurn) {
+      // Silent forever — even after the SDK's nudge. The toolkit must
+      // synthesize a reply from the tool result instead of returning "".
+      return Response.json({ choices: [{ message: { content: "" } }] });
+    }
     if (!sawToolResult) {
       // DELIBERATELY BROKEN: single quotes + string amount with "rs" suffix + trailing comma
       return Response.json({
@@ -215,6 +249,36 @@ const track = (r: Response) => { const c = r.headers.get("set-cookie"); if (c) j
   check("chat export 200 + txt", ex.ok && exText.includes("Khata — Chat History"));
   check("chat export has DAILY section w/ daily msg", exText.includes("DAILY CHAT") && exText.includes("rapido"));
   check("chat export has ANALYSIS section w/ dashboard msg", exText.includes("ANALYSIS AGENT") && exText.includes("break down my expenses"));
+}
+
+// ---------- empty-reply regression: model goes SILENT after the tool call ----------
+{
+  const r = await fetch(`${BASE}/api/chat?action=daily`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", cookie: jar.join("; ") },
+    body: JSON.stringify({ message: "SILENT_TEST 50 rs samosa khaya" }),
+  });
+  const j = await r.json();
+  check("silent-model chat 200", r.ok, String(r.status));
+  check(
+    "silent-model reply NEVER empty",
+    typeof j.reply === "string" && j.reply.trim().length > 0,
+    JSON.stringify(j).slice(0, 200)
+  );
+  check(
+    "silent-model reply synthesized from tool result",
+    /Logged (expense of )?Rs 50/i.test(j.reply ?? ""),
+    JSON.stringify(j).slice(0, 300)
+  );
+  // history stays clean too: the persisted assistant message is the synthesized one
+  const h = await fetch(`${BASE}/api/chat?action=history`, { headers: { cookie: jar.join("; ") } });
+  const hj = await h.json();
+  const lastAssistant = [...(hj.messages ?? [])].reverse().find((m: any) => m.role === "assistant");
+  check(
+    "silent-model history bubble non-empty",
+    !!lastAssistant && (lastAssistant.content ?? "").trim().length > 0,
+    JSON.stringify(lastAssistant ?? {}).slice(0, 200)
+  );
 }
 
 // ---------- restore admin config ----------

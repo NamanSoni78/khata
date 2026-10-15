@@ -100,6 +100,66 @@ function cookieHeader(jar: Record<string, string>) {
 async function main() {
   const vapid = generateVapidKeys();
 
+  // ---- 0. QStash destination-URL regression (mocked QStash API) ----
+  // Root cause of "notifications never came in production": NEXT_PUBLIC_APP_URL
+  // was set WITHOUT a scheme, so every schedule-create 400'd with
+  //   "invalid destination url: endpoint has invalid scheme".
+  // This proves cronUrl() now emits a scheme-valid destination even with the
+  // exact broken env value.
+  {
+    const { createQStashScheduleForReminder } = await import("../src/lib/scheduler");
+    const prevAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+    const prevToken = process.env.QSTASH_TOKEN;
+    const prevCur = process.env.QSTASH_CURRENT_SIGNING_KEY;
+    const prevNext = process.env.QSTASH_NEXT_SIGNING_KEY;
+
+    process.env.NEXT_PUBLIC_APP_URL = "khata.namansoni.in"; // the EXACT broken prod value (no scheme!)
+    process.env.QSTASH_TOKEN = "test_token_for_regression";
+    delete process.env.QSTASH_CURRENT_SIGNING_KEY;
+    delete process.env.QSTASH_NEXT_SIGNING_KEY;
+
+    const captured: Array<{ url: string; body: any }> = [];
+    const origFetch = globalThis.fetch;
+    (globalThis as any).fetch = async (input: any, init: any = {}) => {
+      const url = typeof input === "string" ? input : String(input?.url ?? input);
+      if (url.includes("qstash.upstash.io")) {
+        let body: any = {};
+        try { body = JSON.parse(String(init?.body ?? "{}")); } catch { body = {}; }
+        captured.push({ url, body });
+        return new Response(JSON.stringify({ scheduleId: "sch_regression_1" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return origFetch(input, init);
+    };
+
+    try {
+      const created = await createQStashScheduleForReminder({ id: "regression_r1", type: "daily", time: "20:00" });
+      const dest = captured[0]?.body?.destination ?? "";
+      let parseable = false;
+      try { new URL(dest); parseable = true; } catch { parseable = false; }
+      const okCreated = !!created && created.scheduleId === "sch_regression_1" && created.accountIndex === 0;
+      const okDest = dest === "https://khata.namansoni.in/api/notifications/cron?rid=regression_r1";
+      const okCron = /^\d+ \d+ (?:\*|\d+(?:,\d+)*) \* \*$/.test(String(captured[0]?.body?.cron ?? ""));
+      console.log(`${okCreated ? "✓" : "✗"} qstash: schedule created via mocked API (got: ${JSON.stringify(created)})`);
+      console.log(`${okDest ? "✓" : "✗"} qstash: destination carries https:// despite scheme-less env (got: ${dest})`);
+      console.log(`${parseable ? "✓" : "✗"} qstash: destination is a parseable absolute URL`);
+      console.log(`${okCron ? "✓" : "✗"} qstash: UTC cron expression valid (got: ${captured[0]?.body?.cron})`);
+      if (!okCreated || !okDest || !parseable || !okCron) {
+        throw new Error("QStash destination regression FAILED");
+      }
+    } finally {
+      (globalThis as any).fetch = origFetch;
+      if (prevAppUrl === undefined) delete process.env.NEXT_PUBLIC_APP_URL;
+      else process.env.NEXT_PUBLIC_APP_URL = prevAppUrl;
+      if (prevToken === undefined) delete process.env.QSTASH_TOKEN;
+      else process.env.QSTASH_TOKEN = prevToken;
+      if (prevCur !== undefined) process.env.QSTASH_CURRENT_SIGNING_KEY = prevCur;
+      if (prevNext !== undefined) process.env.QSTASH_NEXT_SIGNING_KEY = prevNext;
+    }
+  }
+
   // ---- fresh local database (schema + seed) ----
   const { execSync } = await import("node:child_process");
   execSync("bunx prisma db push --accept-data-loss", {
@@ -238,7 +298,7 @@ async function main() {
   console.log("✓ push POST received, TTL:", push.headers.ttl, "content-encoding:", push.headers["content-encoding"]);
   const authSecret = Buffer.from(sub.keys.auth, "base64url");
   // Decrypt with the reference http_ece implementation (same lib web-push uses to encrypt)
-  const ece = (await import("http_ece")).default ?? require("http_ece");
+  const ece = (await import("http_ece")).default ?? (await import("http_ece"));
   const payload = ece.decrypt(push.body, {
     version: "aes128gcm",
     privateKey: sub.ecdh,

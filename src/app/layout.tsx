@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import { Plus_Jakarta_Sans } from "next/font/google";
 import "./globals.css";
 import { Toaster as SonnerToaster } from "sonner";
+import { appBaseUrl } from "@/lib/app-url";
 
 /* Brand/display face — bundled at build time (works offline in the PWA). */
 const jakarta = Plus_Jakarta_Sans({
@@ -11,7 +12,9 @@ const jakarta = Plus_Jakarta_Sans({
   variable: "--font-jakarta",
 });
 
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "https://khata.namansoni.in";
+// Normalized (scheme guaranteed) — a scheme-less NEXT_PUBLIC_APP_URL env
+// value would otherwise throw inside new URL() and 500 every page.
+const APP_URL = appBaseUrl();
 
 export const metadata: Metadata = {
   metadataBase: new URL(APP_URL),

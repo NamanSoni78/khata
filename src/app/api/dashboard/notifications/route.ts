@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
 import { db } from "@/lib/db";
-import { createReminder, deleteReminder, pauseReminder, describeReminder } from "@/lib/scheduler";
+import { createReminder, deleteReminder, pauseReminder, describeReminder, repairMissingQStashSchedules } from "@/lib/scheduler";
 
 // GET: list user's reminders (human-readable descriptions — never cron syntax)
 export async function GET() {
@@ -11,6 +11,10 @@ export async function GET() {
   if (!user || user.id === "admin") {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+  // Opportunistic self-healing: re-register QStash exact-time delivery for
+  // reminders that lost it (e.g. created while the app URL env lacked a
+  // scheme). Throttled internally — effectively free on repeated loads.
+  repairMissingQStashSchedules().catch(() => {});
   const notifs = await db.scheduledNotification.findMany({
     where: { userId: user.id },
     orderBy: { createdAt: "desc" },
@@ -78,7 +82,11 @@ export async function POST(req: NextRequest) {
       message: message.trim(),
       timezone: "Asia/Kolkata",
     });
-    return NextResponse.json({ ok: true, id: row.id, description: describeReminder(row) });
+    // delivery tells the client how this reminder will actually fire:
+    //   "exact" — QStash schedule/publish registered (fires at the exact minute)
+    //   "poll"  — no QStash; fires when a server instance is warm
+    const delivery = row.qstashScheduleId ? "exact" : "poll";
+    return NextResponse.json({ ok: true, id: row.id, description: describeReminder(row), delivery });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "Couldn't schedule" }, { status: 400 });
   }

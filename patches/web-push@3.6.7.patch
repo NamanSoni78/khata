@@ -1,0 +1,33 @@
+diff --git a/src/web-push-lib.js b/src/web-push-lib.js
+index a47df054e7d9809cde27d6e645d66f60b84dd8c1..c7c161af8c310e4105b02b806aa12d40667f2cd3 100644
+--- a/src/web-push-lib.js
++++ b/src/web-push-lib.js
+@@ -271,7 +271,9 @@ WebPushLib.prototype.generateRequestDetails = function(subscription, payload, op
+         requestDetails.headers.Authorization = 'key=' + currentGCMAPIKey;
+       }
+     } else if (currentVapidDetails) {
+-      const parsedUrl = url.parse(subscription.endpoint);
++      // Patched (Khata V1.1): WHATWG URL instead of the deprecated url.parse()
++      // — silences Node DEP0169 while producing identical protocol/host values.
++      const parsedUrl = new URL(subscription.endpoint);
+       const audience = parsedUrl.protocol + '//'
+       + parsedUrl.host;
+ 
+@@ -345,10 +347,14 @@ WebPushLib.prototype.sendNotification = function(subscription, payload, options)
+ 
+     return new Promise(function(resolve, reject) {
+       const httpsOptions = {};
+-      const urlParts = url.parse(requestDetails.endpoint);
++      // Patched (Khata V1.1): WHATWG URL instead of the deprecated url.parse()
++      // — silences Node DEP0169. Field mapping is 1:1 with the legacy object:
++      // hostname → hostname, port → port ("" → undefined so Node applies the
++      // scheme default), path → pathname + search.
++      const urlParts = new URL(requestDetails.endpoint);
+       httpsOptions.hostname = urlParts.hostname;
+-      httpsOptions.port = urlParts.port;
+-      httpsOptions.path = urlParts.path;
++      httpsOptions.port = urlParts.port || undefined;
++      httpsOptions.path = urlParts.pathname + urlParts.search;
+ 
+       httpsOptions.headers = requestDetails.headers;
+       httpsOptions.method = requestDetails.method;

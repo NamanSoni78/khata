@@ -61,7 +61,7 @@ export default function DeepDiveChat() {
         {
           id: ++msgId,
           role: "assistant",
-          text: j.reply ?? "(no reply)",
+          text: j.reply || "Done.",
           chartSpec: j.chartSpec ?? null,
         },
       ]);

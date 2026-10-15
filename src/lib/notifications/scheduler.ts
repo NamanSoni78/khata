@@ -40,6 +40,7 @@ const TICK_INTERVAL_MS = 30 * 1000; // 30 s
 const LOOPBACK_TOKEN_HEADER = "X-Internal-Scheduler";
 
 import { primaryAccount } from "@/lib/qstash-pool";
+import { appBaseUrl } from "@/lib/app-url";
 
 let _started = false;
 let _timer: NodeJS.Timeout | null = null;
@@ -48,15 +49,11 @@ let _token: string | null = null;
 
 function resolveAppUrl(): string {
   if (_appUrl) return _appUrl;
-  // NEXT_PUBLIC_APP_URL is set on most deployments; VERCEL_URL is the
-  // per-deployment preview URL Vercel injects; fall back to localhost for dev.
-  _appUrl =
-    process.env.NEXT_PUBLIC_APP_URL ??
-    (process.env.VERCEL_PROJECT_PRODUCTION_URL
-      ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
-      : process.env.VERCEL_URL
-        ? `https://${process.env.VERCEL_URL}`
-        : "http://localhost:3000");
+  // appBaseUrl() normalizes every source (NEXT_PUBLIC_APP_URL without a
+  // scheme, protocol-relative values, VERCEL_URL) — a scheme-less env var
+  // previously made every loopback fetch fail silently, which quietly killed
+  // the fallback poll alongside QStash exact-time delivery.
+  _appUrl = appBaseUrl();
   return _appUrl;
 }
 

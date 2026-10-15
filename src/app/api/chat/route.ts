@@ -8,6 +8,7 @@ import {
 import { resolveDailyAgentConfig, resolveDashboardAgentConfig } from "@/lib/user-config";
 import { runAgent } from "@/lib/agent/loop";
 import { DAILY_TOOLS, DASHBOARD_TOOLS } from "@/lib/agent/tools-defs";
+import { extractChartMarker } from "@/lib/agent/chart-marker";
 import { db } from "@/lib/db";
 
 async function getDailyUser() {
@@ -66,11 +67,23 @@ export async function GET(req: NextRequest) {
       messages: page.map((r) => {
         let meta: any = {};
         try { meta = JSON.parse(r.metadata || "{}"); } catch { meta = {}; }
+        // Strip raw [CHART:{...}] markers from stored content so history
+        // bubbles never show the marker syntax (older rows were persisted
+        // with it inline). If the marker carries a spec and metadata doesn't
+        // already have one, promote the parsed spec so old chart replies
+        // render as charts again after a reload.
+        let content = r.content;
+        let chartSpec = meta.chartSpec ?? null;
+        if (r.role === "assistant" && content.includes("[CHAR")) {
+          const parsed = extractChartMarker(content);
+          content = parsed.cleanText;
+          chartSpec = chartSpec ?? parsed.chartSpec;
+        }
         return {
           role: r.role as "user" | "assistant",
-          content: r.content,
+          content,
           ts: r.createdAt.toISOString(),
-          chartSpec: meta.chartSpec ?? null,
+          chartSpec,
         };
       }),
       hasMore,
@@ -149,6 +162,9 @@ export async function POST(req: NextRequest) {
         finalText += `\n\n📊 Today: ₹${totals.todayIncome} in / ₹${totals.todayExpense} out\n📅 This month: ₹${totals.monthIncome} in / ₹${totals.monthExpense} out`;
       }
     }
+    // Absolute last guard — the client renders `reply` verbatim, and an
+    // empty string would paint an empty bubble.
+    if (!finalText.trim()) finalText = "Done.";
 
     return NextResponse.json({
       reply: finalText,

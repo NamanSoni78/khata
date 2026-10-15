@@ -1,8 +1,9 @@
 import type { MetadataRoute } from "next";
+import { appBaseUrl } from "@/lib/app-url";
 
 /** Sitemap — landing + legal pages (everything else is private/auth-gated). */
 export default function sitemap(): MetadataRoute.Sitemap {
-  const base = process.env.NEXT_PUBLIC_APP_URL ?? "https://khata.namansoni.in";
+  const base = appBaseUrl();
   return [
     {
       url: base,

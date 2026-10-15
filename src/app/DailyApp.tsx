@@ -684,7 +684,7 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
       } else {
         setMessages((m) =>
           m.map((mm, i) =>
-            i === m.length - 1 ? { ...mm, content: j.reply, pending: false, chartSpec: j.chartSpec ?? null } : mm
+            i === m.length - 1 ? { ...mm, content: j.reply || "Done.", pending: false, chartSpec: j.chartSpec ?? null } : mm
           )
         );
       }

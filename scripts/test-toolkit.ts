@@ -24,6 +24,7 @@ import { validateAndCoerce } from "../src/lib/toolkit/schema";
 import { ToolRegistry, type ToolSpec } from "../src/lib/toolkit/registry";
 import { runToolLoop } from "../src/lib/toolkit/agent-loop";
 import { extractInlineToolCalls, sanitizeAssistantText } from "../src/lib/toolkit/parse";
+import { normalizeAppUrl, appBaseUrl } from "../src/lib/app-url";
 import type { AgentConfig } from "../src/lib/admin-config";
 
 let passed = 0;
@@ -463,6 +464,83 @@ async function freshRun(msgs?: Array<{ role: "user"; content: string }>) {
   const req = requestsSeen[0];
   check("k. native request includes tools array", Array.isArray(req.tools) && req.tools.length === 2);
   check("k. tool_choice=auto", req.tool_choice === "auto");
+}
+
+// ---- l. model goes SILENT after tool results → nudge recovers (user's prod bug) ----
+{
+  script = [
+    { toolCalls: [{ id: "c1", name: "log_expense", args: `{"amount":150,"category":"Groceries"}` }] },
+    { content: "" }, // model silent after receiving tool result
+    { content: "Logged Rs 150 for groceries." }, // nudge recovers it
+  ];
+  scriptIdx = 0;
+  requestsSeen = [];
+  const { result } = await freshRun([{ role: "user", content: "150 rs groceries" }]);
+  check("l. post-tool silence → nudged → answer surfaced", result.finalContent.includes("150"));
+  check("l. nudge diagnostic present", result.diagnostics.some((d) => d.includes("nudging")));
+  // the nudge message must be tool-aware (tell the model to answer, not call tools)
+  const nudgeReq = requestsSeen[2]?.messages as Array<{ role: string; content: string }> | undefined;
+  const nudgeMsg = nudgeReq?.find((m) => m.role === "user" && m.content.startsWith("("));
+  check("l. nudge is tool-aware", !!nudgeMsg && nudgeMsg.content.includes("Reply to the user"));
+}
+
+// ---- m. model silent even AFTER nudge → reply synthesized from tool results ----
+{
+  script = [
+    { toolCalls: [{ id: "c1", name: "log_expense", args: `{"amount":90,"category":"Tea"}` }] },
+    { content: "" }, // silent
+    { content: "" }, // still silent after nudge
+  ];
+  scriptIdx = 0;
+  const { result } = await freshRun([{ role: "user", content: "90 rs chai" }]);
+  check("m. silent model → synthesized from tool result", result.finalContent.includes("Logged Rs 90"));
+  check("m. synthesized reply is non-empty", result.finalContent.trim().length > 0);
+}
+
+// ---- n. EXACT production sequence: native 400 'No tool call found for function
+//       call output' → JSON degrade → silent → synthesized (never empty) ----
+{
+  script = [
+    { toolCalls: [{ id: "call_nc63HNuqyQn", name: "log_expense", args: `{"amount":200,"category":"Zomato"}` }] },
+    { status: 400, body: '{"success":false,"error":{"message":"No tool call found for function call output with call_id call_nc63HNuqyQn"}}' },
+    { content: `{"tool_call":{"name":"log_expense","arguments":{"amount":200,"category":"Zomato"}}}` },
+    { content: "" }, // silent
+    { content: "" }, // still silent
+  ];
+  scriptIdx = 0;
+  const { result } = await freshRun([{ role: "user", content: "200 rs zomato" }]);
+  check("n. degraded after 400 tool-output rejection", result.degraded === true && result.mode === "json");
+  check("n. tool executed post-degradation", result.toolCalls.some((c) => c.executed));
+  check("n. final reply NEVER empty (synthesized)", result.finalContent.trim().length > 0);
+  check("n. synthesized reply shows the tool outcome", /Logged Rs 200/.test(result.finalContent));
+}
+
+/* ================================================================
+   6. APP URL NORMALIZATION (QStash invalid-scheme root cause)
+   ================================================================ */
+console.log("\n── 6. App URL normalization (QStash fix) ──────");
+
+{
+  eq("url: bare domain gets https", normalizeAppUrl("khata.namansoni.in"), "https://khata.namansoni.in");
+  eq("url: protocol-relative fixed", normalizeAppUrl("//khata.namansoni.in"), "https://khata.namansoni.in");
+  eq("url: trailing slash stripped", normalizeAppUrl("https://khata.namansoni.in/"), "https://khata.namansoni.in");
+  eq("url: path stripped to origin", normalizeAppUrl("https://khata.namansoni.in/some/path"), "https://khata.namansoni.in");
+  eq("url: query+hash stripped", normalizeAppUrl("khata.namansoni.in?a=1#x"), "https://khata.namansoni.in");
+  eq("url: whitespace trimmed", normalizeAppUrl("  https://khata.namansoni.in  "), "https://khata.namansoni.in");
+  eq("url: localhost gets http", normalizeAppUrl("localhost:3000"), "http://localhost:3000");
+  eq("url: 127.0.0.1 gets http", normalizeAppUrl("127.0.0.1:3000"), "http://127.0.0.1:3000");
+  eq("url: explicit http scheme kept", normalizeAppUrl("http://10.0.0.5:3000"), "http://10.0.0.5:3000");
+  eq("url: empty → null", normalizeAppUrl(""), null);
+  eq("url: only slashes → null", normalizeAppUrl("//"), null);
+  eq("url: scheme + host case normalized", normalizeAppUrl("HTTPS://KHATA.NAMANSONI.IN"), "https://KHATA.NAMANSONI.IN");
+  // appBaseUrl resolves to a valid absolute URL under ANY env configuration
+  const prev = process.env.NEXT_PUBLIC_APP_URL;
+  process.env.NEXT_PUBLIC_APP_URL = "khata.namansoni.in"; // the EXACT broken prod value
+  const base = appBaseUrl();
+  let parsedOk = false;
+  try { new URL(`${base}/api/notifications/cron?rid=x`); parsedOk = true; } catch { parsedOk = false; }
+  check("url: appBaseUrl(scheme-less env) yields a QStash-valid destination", parsedOk && base === "https://khata.namansoni.in");
+  process.env.NEXT_PUBLIC_APP_URL = prev;
 }
 
 server.stop(true);

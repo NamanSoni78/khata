@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { sendPushToUser, resolveMessageTemplate, isWebPushConfigured } from "@/lib/notifications/push";
-import { computeNextRun } from "@/lib/scheduler";
+import { computeNextRun, repairMissingQStashSchedules } from "@/lib/scheduler";
 import { allTokens, allSigningKeys } from "@/lib/qstash-pool";
 // Self-start the in-process scheduler the first time this module loads on
 // any warm instance. It's idempotent and unref'd, so it never blocks shutdown.
@@ -72,6 +72,11 @@ export async function POST(req: NextRequest) {
     if (r.sent > 0) fired++;
   }
 
+  // Self-healing: re-register exact-time QStash delivery for reminders whose
+  // schedule never got created (e.g. while NEXT_PUBLIC_APP_URL was scheme-less
+  // and every create 400'd). Throttled internally to one pass / 10 min.
+  const repaired = await repairMissingQStashSchedules();
+
   // Legacy rows (pre-v2, cron/ISO strings) — best-effort migration to v2 fields
   try {
     const legacy = await db.scheduledNotification.findMany({
@@ -94,6 +99,7 @@ export async function POST(req: NextRequest) {
     ok: true,
     checked: dueRows.length,
     fired,
+    repaired,
     at: now.toISOString(),
   });
 }

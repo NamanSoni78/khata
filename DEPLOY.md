@@ -43,7 +43,7 @@ Import the repo, then set these env vars (Production **and** Preview):
 | `DATABASE_URL` | `libsql://…` from Turso |
 | `DATABASE_AUTH_TOKEN` | token from Turso |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | your /admin credentials (bcrypt hash preferred: `bun run hash-password <pw>`) |
-| `NEXT_PUBLIC_APP_URL` | `https://khata.namansoni.in` |
+| `NEXT_PUBLIC_APP_URL` | `https://khata.namansoni.in` (scheme optional since V1.1 — bare domains are auto-normalized to `https://`; this fixed the QStash "invalid destination scheme" error) |
 | `RESEND_API_KEY` | `re_…` from Resend |
 | `RESEND_FROM` *(optional)* | `Khata <no-reply@khata.namansoni.in>` |
 | `NEXT_PUBLIC_VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | from gen-vapid |

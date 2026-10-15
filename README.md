@@ -46,7 +46,7 @@ Resend (email OTP) · Web Push (VAPID) + Upstash QStash · PWA.
 ## Quick start (local)
 
 ```bash
-bun install
+bun install                  # also applies patches/web-push@3.6.7.patch (url.parse deprecation fix)
 cp .env.example .env        # set DATABASE_URL="file:./db/khata.db" for local
 bun run db:push             # create local SQLite schema
 bun run db:seed             # default admin config (agents, flags, glossary)
@@ -65,7 +65,7 @@ Open http://localhost:3000 → sign up (dev mode shows the OTP on screen when no
 3. **Vercel**: import the repo and set env vars (see `.env.example`):
    - `DATABASE_URL` + `DATABASE_AUTH_TOKEN` (from Turso)
    - `ADMIN_USERNAME` / `ADMIN_PASSWORD`
-   - `NEXT_PUBLIC_APP_URL` = `https://khata.namansoni.in`
+   - `NEXT_PUBLIC_APP_URL` = `https://khata.namansoni.in` (scheme optional since V1.1 — a bare `khata.namansoni.in` is auto-normalized to `https://`)
    - `RESEND_API_KEY` (+ optional `RESEND_FROM`)
    - VAPID keys (`bun run gen-vapid`) + `VAPID_SUBJECT`
    - QStash token + signing keys (multi-account supported, `;`-separated)

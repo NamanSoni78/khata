@@ -28,6 +28,7 @@ import {
   accountForIndex,
   primaryAccount,
 } from "@/lib/qstash-pool";
+import { appBaseUrl } from "@/lib/app-url";
 
 const IST_OFFSET_MIN = 5 * 60 + 30; // IST = UTC + 5:30
 
@@ -229,14 +230,10 @@ export function isQStashConfigured(): boolean {
 
 /** Absolute cron URL for a reminder (works on any host, incl. khata.namansoni.in). */
 function cronUrl(reminderId: string): string {
-  const base =
-    process.env.NEXT_PUBLIC_APP_URL ??
-    (process.env.VERCEL_PROJECT_PRODUCTION_URL
-      ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
-      : process.env.VERCEL_URL
-        ? `https://${process.env.VERCEL_URL}`
-        : "http://localhost:3000");
-  return `${base.replace(/\/$/, "")}/api/notifications/cron?rid=${reminderId}`;
+  // appBaseUrl() normalizes NEXT_PUBLIC_APP_URL / VERCEL_URL — a scheme-less
+  // value like "khata.namansoni.in" becomes https://khata.namansoni.in, so
+  // QStash never rejects the destination with "invalid scheme" again.
+  return `${appBaseUrl()}/api/notifications/cron?rid=${reminderId}`;
 }
 
 /**
@@ -382,7 +379,9 @@ export async function createReminder(userId: string, input: ReminderInput) {
     }
   }
 
-  return row;
+  // Return the FRESH row (with qstashScheduleId set when exact-time delivery
+  // registered) so callers can tell the user how the reminder will fire.
+  return (await db.scheduledNotification.findUnique({ where: { id: row.id } })) ?? row;
 }
 
 export async function deleteReminder(userId: string, id: string) {
@@ -416,6 +415,76 @@ export async function pauseReminder(userId: string, id: string, isActive: boolea
       });
     }
   }
+}
+
+// ============================================================
+//  Self-healing: repair reminders whose QStash delivery never
+//  registered (e.g. created while NEXT_PUBLIC_APP_URL lacked a
+//  scheme — every schedule create 400'd, so rows sit with
+//  qstashScheduleId = null and only the catch-all poll fires them).
+// ============================================================
+
+let _lastRepairAt = 0;
+const REPAIR_THROTTLE_MS = 10 * 60 * 1000; // at most one pass per 10 min per instance
+
+/**
+ * Re-register exact-time QStash delivery for active reminders that are
+ * missing it. Idempotent, throttled, never throws — safe to call from the
+ * cron endpoint, the notifications API, or anywhere else opportunistically.
+ * Returns how many reminders were repaired.
+ */
+export async function repairMissingQStashSchedules(force = false): Promise<number> {
+  if (!isQStashConfigured()) return 0;
+  const now = Date.now();
+  if (!force && now - _lastRepairAt < REPAIR_THROTTLE_MS) return 0;
+  _lastRepairAt = now;
+
+  let repaired = 0;
+  try {
+    // 1. Recurring reminders with no schedule → create one now.
+    const recurring = await db.scheduledNotification.findMany({
+      where: {
+        isActive: true,
+        qstashScheduleId: null,
+        type: { in: ["daily", "weekly", "monthly"] },
+      },
+      take: 25,
+    });
+    for (const row of recurring) {
+      const created = await createQStashScheduleForReminder(row);
+      if (created) {
+        await db.scheduledNotification.update({
+          where: { id: row.id },
+          data: { qstashScheduleId: created.scheduleId, qstashAccount: created.accountIndex },
+        });
+        repaired++;
+      }
+    }
+
+    // 2. One-timers still in the future (within QStash's 6-day publish
+    //    window) whose delayed publish never went out → publish now.
+    const onetimers = await db.scheduledNotification.findMany({
+      where: {
+        isActive: true,
+        type: "once",
+        nextRunAt: { gt: new Date(), lt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000) },
+      },
+      take: 25,
+    });
+    for (const row of onetimers) {
+      // publishOneTimeQStash is idempotent enough here: a duplicate publish
+      // at worst double-fires a one-shot the poll would have fired anyway.
+      if (await publishOneTimeQStash({ id: row.id, nextRunAt: row.nextRunAt })) {
+        repaired++;
+      }
+    }
+  } catch (e) {
+    console.error("[qstash] repair pass error:", e);
+  }
+  if (repaired > 0) {
+    console.log(`[qstash] repair pass re-registered exact-time delivery for ${repaired} reminder(s)`);
+  }
+  return repaired;
 }
 
 /** Human-readable description for UI lists (NO cron syntax ever shown). */

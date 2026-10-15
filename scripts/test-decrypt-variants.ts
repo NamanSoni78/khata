@@ -102,7 +102,7 @@ tryDecrypt("V4 legacy-mix", cek4, nonce4);
 
 
 // Variant 5: http_ece reference implementation decrypt
-const ece = require("http_ece");
+const ece = (await import("http_ece")).default ?? (await import("http_ece"));
 try {
   const plain = ece.decrypt(body, {
     version: "aes128gcm",

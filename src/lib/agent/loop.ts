@@ -162,9 +162,22 @@ async function runAgentInner(opts: {
     // user-role synthetic nudges: intentionally not persisted
   }
 
-  // 7. Persist the final assistant message
-  const finalText = result.finalContent || "(no response)";
-  await persistFinalAssistantMessage(userId, finalText, {
+  // 7. Extract the chart marker BEFORE persisting so the stored bubble text
+  //    is already clean (raw [CHART:{...}] markers used to leak into history
+  //    bubbles after a reload); the spec rides in message metadata.
+  //    (finalContent is guaranteed non-empty by the SDK's post-loop
+  //    synthesis, but we still keep local fallbacks — belt and suspenders.)
+  const finalText = result.finalContent;
+  const { cleanText, chartSpec } = extractChartMarker(finalText);
+  // Never persist an empty body: a chart-only reply still gets a caption,
+  // and a truly empty model output falls back to the last tool result so
+  // the user always sees what the agent actually did.
+  const persistedText =
+    cleanText ||
+    (chartSpec ? "Here's the chart:" : "") ||
+    synthesizeFromToolCalls(result.toolCalls) ||
+    "Done.";
+  await persistFinalAssistantMessage(userId, persistedText, {
     toolCalls: [],
     source: opts.agentType,
   });
@@ -172,8 +185,7 @@ async function runAgentInner(opts: {
   // 8. Post-processing: auto-link multi-leg txns
   await autoLinkTurnTxnsToGroup(userId, result.toolCalls);
 
-  // 9. Extract chart marker (if the agent offered a chart)
-  const { cleanText, chartSpec } = extractChartMarker(finalText);
+  // 9. Attach the chart spec (if any) to the message we just persisted
   if (chartSpec) {
     await attachChartSpecToLastMessage(userId, opts.agentType, chartSpec);
   }
@@ -183,7 +195,7 @@ async function runAgentInner(opts: {
   }
 
   return {
-    assistantText: cleanText,
+    assistantText: persistedText,
     chartSpec,
     toolCalls: result.toolCalls.map((c) => ({ name: c.name, args: c.args, result: c.result })),
     tokensUsed: 0,
@@ -205,6 +217,18 @@ async function persistFinalAssistantMessage(
       metadata: JSON.stringify(meta),
     },
   });
+}
+
+/** Last-resort user-visible text built from this turn's tool results. */
+function synthesizeFromToolCalls(
+  toolCalls: Array<{ name: string; result: string; executed?: boolean }>
+): string | null {
+  const done = toolCalls.filter((c) => c.executed !== false);
+  const last = done[done.length - 1];
+  if (!last) return null;
+  const line = last.result.split("\n").map((l) => l.trim()).filter(Boolean)[0];
+  if (!line) return null;
+  return line.length > 200 ? `${line.slice(0, 197)}…` : line;
 }
 
 /** Attach a parsed chart spec to the most recent assistant message of the SAME thread. */

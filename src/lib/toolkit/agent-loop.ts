@@ -83,6 +83,8 @@ export async function runToolLoop(opts: LoopOptions): Promise<LoopResult> {
   let iteration = 0;
   let finalContent = "";
   let consecutiveFailed = 0;
+  // One empty-response nudge per run (any iteration — see below).
+  let nudged = false;
 
   // Dedup guard: same (name + canonical args) never dispatches twice.
   const dispatchedKeys = new Set<string>();
@@ -137,10 +139,22 @@ export async function runToolLoop(opts: LoopOptions): Promise<LoopResult> {
     /* ---------- No tool calls → final answer ---------- */
     if (calls.length === 0) {
       finalContent = sanitizeAssistantText(content);
-      if (!finalContent && iteration === 1) {
-        // Model returned nothing at all — nudge once
-        diagnostics.push("empty first response — nudging");
-        messages.push({ role: "user", content: "(Please answer the last question.)" });
+      if (!finalContent && !nudged) {
+        // Model returned nothing usable. This happens MOST after tool rounds —
+        // strict tool-calling endpoints emit only tool_calls (empty content),
+        // and some models go quiet again after receiving the results. Nudge
+        // ONCE at ANY iteration (the old code only nudged on iteration 1, so
+        // post-tool empties broke out with finalContent = "" → the user saw
+        // an empty bubble / "(no response)").
+        nudged = true;
+        diagnostics.push(`empty response at iteration ${iteration} — nudging`);
+        const ranTools = toolCalls.some((c) => c.executed);
+        messages.push({
+          role: "user",
+          content: ranTools
+            ? "(You just ran tools and have their results. Reply to the user NOW with a short natural-language answer — no JSON, no more tool calls.)"
+            : "(Please answer the last question.)",
+        });
         continue;
       }
       break;
@@ -161,7 +175,8 @@ export async function runToolLoop(opts: LoopOptions): Promise<LoopResult> {
     if (unique.length === 0) {
       // Everything this round was a duplicate → model is stuck in a loop
       diagnostics.push("all calls this round were duplicates — stopping");
-      finalContent = sanitizeAssistantText(content) || "Done.";
+      finalContent =
+        sanitizeAssistantText(content) || synthesizeReply(toolCalls) || "Done.";
       break;
     }
 
@@ -223,9 +238,23 @@ export async function runToolLoop(opts: LoopOptions): Promise<LoopResult> {
     // continue → model sees tool results and produces the next turn
   }
 
-  if (iteration >= maxIterations && !finalContent) {
-    finalContent = "That took too many steps — I stopped to avoid going in circles. Could you rephrase?";
-    diagnostics.push(`hit max iterations (${maxIterations})`);
+  // GUARANTEE: the user NEVER sees an empty bubble. Strict tool-calling
+  // endpoints (the "No tool call found for function call output…" family that
+  // forces JSON-mode degradation) sometimes end the run with no final text at
+  // all. When that happens we synthesize a reply from the tool results so the
+  // user still sees what the model actually DID.
+  if (!finalContent) {
+    const synthesized = synthesizeReply(toolCalls);
+    if (synthesized) {
+      diagnostics.push("model produced no final text — synthesized reply from tool results");
+      finalContent = synthesized;
+    } else if (iteration >= maxIterations) {
+      diagnostics.push(`hit max iterations (${maxIterations})`);
+      finalContent = "That took too many steps — I stopped to avoid going in circles. Could you rephrase?";
+    } else {
+      diagnostics.push("model returned empty content");
+      finalContent = "Hmm, I didn't get a reply from the model. Could you try again?";
+    }
   }
 
   return { finalContent, toolCalls, mode, degraded, iterations: iteration, diagnostics };
@@ -234,6 +263,25 @@ export async function runToolLoop(opts: LoopOptions): Promise<LoopResult> {
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
+
+/**
+ * Build a short user-facing reply from the executed tool results (the last
+ * one wins — it's the most recent outcome of the run). Tool results read
+ * like "Logged expense of ₹200 to Zomato (Food). Txn ID: abc123", so the
+ * first line alone is usually a perfectly good confirmation message.
+ */
+function synthesizeReply(toolCalls: ExecutedCall[]): string | null {
+  const executed = toolCalls.filter((c) => c.executed);
+  if (executed.length === 0) return null;
+  const last = executed[executed.length - 1];
+  const line = last.result
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)[0];
+  if (!line) return null;
+  const trimmed = line.length > 180 ? `${line.slice(0, 177)}…` : line;
+  return trimmed;
+}
 
 /** Stable, order-independent key for dedup. */
 function stableArgsKey(raw: string | Record<string, unknown>): string {

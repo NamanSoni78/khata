@@ -43,7 +43,8 @@ Import the repo, then set these env vars (Production **and** Preview):
 | `DATABASE_URL` | `libsql://…` from Turso |
 | `DATABASE_AUTH_TOKEN` | token from Turso |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | your /admin credentials (bcrypt hash preferred: `bun run hash-password <pw>`) |
-| `NEXT_PUBLIC_APP_URL` | `https://khata.namansoni.in` (scheme optional since V1.1 — bare domains are auto-normalized to `https://`; this fixed the QStash "invalid destination scheme" error) |
+| `APP_URL` | `https://khata.namansoni.in` — **recommended** (plain runtime var; always read at runtime, never build-inlined) |
+| `NEXT_PUBLIC_APP_URL` | `https://khata.namansoni.in` — optional; ⚠️ build-time-inlined on Vercel: **editing it does nothing until you redeploy**, and quoted/pasted values can defeat naive normalization. V1.2 no longer depends on it for QStash destinations (they're derived from the live request headers) |
 | `RESEND_API_KEY` | `re_…` from Resend |
 | `RESEND_FROM` *(optional)* | `Khata <no-reply@khata.namansoni.in>` |
 | `NEXT_PUBLIC_VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | from gen-vapid |
@@ -91,5 +92,25 @@ Also keep the Resend DKIM/SPF records in place.
 | Signup says "email isn't configured" | `RESEND_API_KEY` missing in Vercel env |
 | OTP mails in spam | complete Resend domain verification (DKIM/SPF) |
 | 500 on login/chat | `DATABASE_URL`/`DATABASE_AUTH_TOKEN` wrong → check Turso token |
-| Reminders don't fire | check `QSTASH_TOKEN` + the catch-all cron (step 6.5) |
+| Reminders don't fire | check `QSTASH_TOKEN` + the catch-all cron (step 6.5); V1.2+ also self-heals broken schedules on the next dashboard visit / cron tick |
 | "The assistant isn't set up yet" | configure the daily agent in `/admin` |
+
+### Notifications checklist (V1.2)
+
+1. **Server log shows `[qstash] schedule create failed … invalid destination url`**
+   → shouldn't happen anymore: destinations are built from the live request
+   headers. If you ever see it, the log now prints the exact destination +
+   all env values — set `APP_URL=https://<your-domain>` and **redeploy**
+   (reminder: `NEXT_PUBLIC_*` edits require a redeploy to take effect at all).
+2. **"Enable notifications" / "Send test" did nothing**
+   → fixed in V1.2 (the service worker was never registered before). After
+   redeploying, reload the app once, then Settings → Enable notifications →
+   Send test. The test now reports the TRUTH ("No device is subscribed…")
+   instead of a fake "Sent!".
+3. **Permission prompt** fires automatically the moment you set any
+   notification (dashboard Schedule/Resume buttons, or "remind me at 8pm"
+   in chat). If the browser already blocked notifications, unblock via the
+   lock icon → Notifications → Allow, then reload.
+4. **Subscriptions are per-device**: enable on every device you want
+   notifications on. The dashboard's reminders tab shows each device's
+   status and has its own Send-test button.

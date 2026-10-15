@@ -28,7 +28,7 @@ import {
   accountForIndex,
   primaryAccount,
 } from "@/lib/qstash-pool";
-import { appBaseUrl } from "@/lib/app-url";
+import { appBaseUrl, normalizeAppUrl, isLocalhostUrl } from "@/lib/app-url";
 
 const IST_OFFSET_MIN = 5 * 60 + 30; // IST = UTC + 5:30
 
@@ -228,27 +228,50 @@ export function isQStashConfigured(): boolean {
   return !!process.env.QSTASH_TOKEN;
 }
 
-/** Absolute cron URL for a reminder (works on any host, incl. khata.namansoni.in). */
-function cronUrl(reminderId: string): string {
-  // appBaseUrl() normalizes NEXT_PUBLIC_APP_URL / VERCEL_URL — a scheme-less
-  // value like "khata.namansoni.in" becomes https://khata.namansoni.in, so
-  // QStash never rejects the destination with "invalid scheme" again.
-  return `${appBaseUrl()}/api/notifications/cron?rid=${reminderId}`;
+/**
+ * Absolute cron URL for a reminder (works on any host, incl. khata.namansoni.in).
+ *
+ * `baseUrl` — when the caller runs inside a request, pass the REQUEST-DERIVED
+ * origin (see originFromRequest()). It beats every env var because it is the
+ * host the client demonstrably just reached us on; env values can be stale
+ * (NEXT_PUBLIC_* vars are BUILD-TIME inlined on Vercel) or mangled (quotes).
+ * Falls back to the hardened env chain when absent.
+ * The result is ALWAYS validated: scheme http(s) + parsable, or we return
+ * null and the caller skips QStash instead of sending garbage.
+ */
+function cronUrl(reminderId: string, baseUrl?: string): string | null {
+  const base =
+    (baseUrl ? normalizeAppUrl(baseUrl) : null) ?? appBaseUrl();
+  const url = `${base}/api/notifications/cron?rid=${encodeURIComponent(reminderId)}`;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    // A loopback destination is useless to QStash (its servers can't reach
+    // the user's machine) — dev/local relies on the in-process scheduler,
+    // so skip schedule registration instead of registering dead weight.
+    if (isLocalhostUrl(url)) return null;
+    return url;
+  } catch {
+    return null;
+  }
 }
 
 /**
  * Create a QStash schedule for a recurring reminder (exact-minute delivery)
  * on the least-loaded pooled account.
  * Returns { scheduleId, accountIndex }, or null when QStash isn't
- * configured / not applicable.
+ * configured / not applicable / the destination URL can't be built.
  */
-export async function createQStashScheduleForReminder(reminder: {
-  id: string;
-  type: string;
-  time: string;
-  daysOfWeek?: string | null;
-  dayOfMonth?: number | null;
-}): Promise<{ scheduleId: string; accountIndex: number } | null> {
+export async function createQStashScheduleForReminder(
+  reminder: {
+    id: string;
+    type: string;
+    time: string;
+    daysOfWeek?: string | null;
+    dayOfMonth?: number | null;
+  },
+  baseUrl?: string
+): Promise<{ scheduleId: string; accountIndex: number } | null> {
   if (!isQStashConfigured()) return null;
   if (reminder.type === "once") return null; // one-timers use delayed publish
 
@@ -258,6 +281,21 @@ export async function createQStashScheduleForReminder(reminder: {
   const account = await pickAccountForNewSchedule();
   if (!account) return null;
 
+  const destination = cronUrl(reminder.id, baseUrl);
+  if (!destination) {
+    // NEVER send a malformed destination to QStash — that's the exact 400
+    // ("invalid destination url: endpoint has invalid scheme") this module
+    // exists to prevent. Log enough context to fix the env in one glance.
+    console.error(
+      `[qstash] skipping schedule create: no valid destination could be built ` +
+        `(baseUrl=${baseUrl ?? "<none>"}, env appBaseUrl()=${appBaseUrl()}, ` +
+        `NEXT_PUBLIC_APP_URL=${JSON.stringify(process.env.NEXT_PUBLIC_APP_URL ?? null)}, ` +
+        `APP_URL=${JSON.stringify(process.env.APP_URL ?? null)}). ` +
+        `Set APP_URL=https://<your-domain> in the deployment env and redeploy.`
+    );
+    return null;
+  }
+
   try {
     const res = await fetch(`${QSTASH_BASE}/schedules`, {
       method: "POST",
@@ -266,19 +304,26 @@ export async function createQStashScheduleForReminder(reminder: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        destination: cronUrl(reminder.id),
+        destination,
         cron,
       }),
     });
     if (!res.ok) {
-      console.error(`[qstash] schedule create failed (acct ${account.index}):`, res.status, await res.text());
+      // Log the DESTINATION too — the 400 body alone never told us WHICH
+      // URL was rejected, which is why this bug survived two fix attempts.
+      console.error(
+        `[qstash] schedule create failed (acct ${account.index}):`,
+        res.status,
+        await res.text(),
+        `— destination was: ${destination}`
+      );
       return null;
     }
     const json = await res.json();
     if (!json.scheduleId) return null;
     return { scheduleId: json.scheduleId, accountIndex: account.index };
   } catch (e) {
-    console.error("[qstash] schedule create error:", e);
+    console.error("[qstash] schedule create error:", e, `— destination was: ${destination}`);
     return null;
   }
 }
@@ -307,17 +352,29 @@ export async function deleteQStashSchedule(
  * (nextRunAt comparison) until within 7 days. Publishes rotate across pooled
  * accounts to spread quota usage.
  */
-export async function publishOneTimeQStash(reminder: {
-  id: string;
-  nextRunAt: Date | null;
-}): Promise<boolean> {
+export async function publishOneTimeQStash(
+  reminder: {
+    id: string;
+    nextRunAt: Date | null;
+  },
+  baseUrl?: string
+): Promise<boolean> {
   if (!isQStashConfigured() || !reminder.nextRunAt) return false;
   const delaySec = Math.floor((reminder.nextRunAt.getTime() - Date.now()) / 1000);
   if (delaySec <= 0 || delaySec > 6 * 24 * 60 * 60) return false; // >6 days out: let poll handle later
   const account = pickAccountForPublish();
   if (!account) return false;
+  const destination = cronUrl(reminder.id, baseUrl);
+  if (!destination) {
+    console.error(
+      `[qstash] skipping one-time publish: no valid destination ` +
+        `(baseUrl=${baseUrl ?? "<none>"}, env appBaseUrl()=${appBaseUrl()}). ` +
+        `Set APP_URL=https://<your-domain> in the deployment env and redeploy.`
+    );
+    return false;
+  }
   try {
-    const res = await fetch(`${QSTASH_BASE}/publish/${encodeURIComponent(cronUrl(reminder.id))}`, {
+    const res = await fetch(`${QSTASH_BASE}/publish/${encodeURIComponent(destination)}`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${account.token}`,
@@ -327,9 +384,17 @@ export async function publishOneTimeQStash(reminder: {
       },
       body: JSON.stringify({ rid: reminder.id }),
     });
+    if (!res.ok) {
+      console.error(
+        "[qstash] one-time publish failed:",
+        res.status,
+        await res.text(),
+        `— destination was: ${destination}`
+      );
+    }
     return res.ok;
   } catch (e) {
-    console.error("[qstash] publish error:", e);
+    console.error("[qstash] publish error:", e, `— destination was: ${destination}`);
     return false;
   }
 }
@@ -338,7 +403,11 @@ export async function publishOneTimeQStash(reminder: {
 //  Create / update / delete a reminder (DB + QStash together)
 // ============================================================
 
-export async function createReminder(userId: string, input: ReminderInput) {
+export async function createReminder(
+  userId: string,
+  input: ReminderInput,
+  opts?: { baseUrl?: string }
+) {
   const nextRunAt = computeNextRun(input);
   if (!nextRunAt && input.type !== "once") {
     throw new Error("Could not compute the next run time — check the time and repeat settings.");
@@ -346,6 +415,8 @@ export async function createReminder(userId: string, input: ReminderInput) {
   if (input.type === "once" && nextRunAt && nextRunAt.getTime() <= Date.now()) {
     throw new Error("That time is already in the past — pick a future date/time.");
   }
+
+  const baseUrl = opts?.baseUrl;
 
   const row = await db.scheduledNotification.create({
     data: {
@@ -367,9 +438,9 @@ export async function createReminder(userId: string, input: ReminderInput) {
   // Exact-time delivery via QStash (best-effort; poll is the fallback)
   if (row.isActive) {
     if (row.type === "once") {
-      await publishOneTimeQStash({ id: row.id, nextRunAt: row.nextRunAt });
+      await publishOneTimeQStash({ id: row.id, nextRunAt: row.nextRunAt }, baseUrl);
     } else {
-      const created = await createQStashScheduleForReminder(row);
+      const created = await createQStashScheduleForReminder(row, baseUrl);
       if (created) {
         await db.scheduledNotification.update({
           where: { id: row.id },
@@ -391,7 +462,12 @@ export async function deleteReminder(userId: string, id: string) {
   await db.scheduledNotification.delete({ where: { id: row.id } }).catch(() => {});
 }
 
-export async function pauseReminder(userId: string, id: string, isActive: boolean) {
+export async function pauseReminder(
+  userId: string,
+  id: string,
+  isActive: boolean,
+  opts?: { baseUrl?: string }
+) {
   const row = await db.scheduledNotification.findFirst({ where: { id, userId } });
   if (!row) return;
   if (!isActive && row.qstashScheduleId) {
@@ -407,7 +483,7 @@ export async function pauseReminder(userId: string, id: string, isActive: boolea
   });
   if (isActive && row.type !== "once") {
     // Re-register the exact-time schedule on resume
-    const created = await createQStashScheduleForReminder(row);
+    const created = await createQStashScheduleForReminder(row, opts?.baseUrl);
     if (created) {
       await db.scheduledNotification.update({
         where: { id: row.id },
@@ -433,7 +509,10 @@ const REPAIR_THROTTLE_MS = 10 * 60 * 1000; // at most one pass per 10 min per in
  * cron endpoint, the notifications API, or anywhere else opportunistically.
  * Returns how many reminders were repaired.
  */
-export async function repairMissingQStashSchedules(force = false): Promise<number> {
+export async function repairMissingQStashSchedules(
+  force = false,
+  baseUrl?: string
+): Promise<number> {
   if (!isQStashConfigured()) return 0;
   const now = Date.now();
   if (!force && now - _lastRepairAt < REPAIR_THROTTLE_MS) return 0;
@@ -451,7 +530,7 @@ export async function repairMissingQStashSchedules(force = false): Promise<numbe
       take: 25,
     });
     for (const row of recurring) {
-      const created = await createQStashScheduleForReminder(row);
+      const created = await createQStashScheduleForReminder(row, baseUrl);
       if (created) {
         await db.scheduledNotification.update({
           where: { id: row.id },
@@ -474,7 +553,7 @@ export async function repairMissingQStashSchedules(force = false): Promise<numbe
     for (const row of onetimers) {
       // publishOneTimeQStash is idempotent enough here: a duplicate publish
       // at worst double-fires a one-shot the poll would have fired anyway.
-      if (await publishOneTimeQStash({ id: row.id, nextRunAt: row.nextRunAt })) {
+      if (await publishOneTimeQStash({ id: row.id, nextRunAt: row.nextRunAt }, baseUrl)) {
         repaired++;
       }
     }

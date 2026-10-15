@@ -3,6 +3,7 @@ import { db } from "@/lib/db";
 import { sendPushToUser, resolveMessageTemplate, isWebPushConfigured } from "@/lib/notifications/push";
 import { computeNextRun, repairMissingQStashSchedules } from "@/lib/scheduler";
 import { allTokens, allSigningKeys } from "@/lib/qstash-pool";
+import { originFromRequest } from "@/lib/app-url";
 // Self-start the in-process scheduler the first time this module loads on
 // any warm instance. It's idempotent and unref'd, so it never blocks shutdown.
 import { startInProcessScheduler } from "@/lib/notifications/scheduler";
@@ -74,8 +75,14 @@ export async function POST(req: NextRequest) {
 
   // Self-healing: re-register exact-time QStash delivery for reminders whose
   // schedule never got created (e.g. while NEXT_PUBLIC_APP_URL was scheme-less
-  // and every create 400'd). Throttled internally to one pass / 10 min.
-  const repaired = await repairMissingQStashSchedules();
+  // and every create 400'd). The request-derived origin (the host QStash or
+  // the daily-app poll just used to reach us) is the healthiest destination
+  // — immune to stale build-time-inlined env values. Throttled to one pass /
+  // 10 min.
+  const repaired = await repairMissingQStashSchedules(
+    false,
+    originFromRequest(req) ?? undefined
+  );
 
   // Legacy rows (pre-v2, cron/ISO strings) — best-effort migration to v2 fields
   try {

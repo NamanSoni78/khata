@@ -3,9 +3,10 @@ import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
 import { db } from "@/lib/db";
 import { createReminder, deleteReminder, pauseReminder, describeReminder, repairMissingQStashSchedules } from "@/lib/scheduler";
+import { originFromRequest } from "@/lib/app-url";
 
 // GET: list user's reminders (human-readable descriptions — never cron syntax)
-export async function GET() {
+export async function GET(req: NextRequest) {
   const token = await getSessionToken("dashboard");
   const user = await getSessionUser(token, "dashboard");
   if (!user || user.id === "admin") {
@@ -13,8 +14,11 @@ export async function GET() {
   }
   // Opportunistic self-healing: re-register QStash exact-time delivery for
   // reminders that lost it (e.g. created while the app URL env lacked a
-  // scheme). Throttled internally — effectively free on repeated loads.
-  repairMissingQStashSchedules().catch(() => {});
+  // scheme — every schedule create 400'd back then). The request-derived
+  // origin (x-forwarded-host/proto) is the healthiest possible destination:
+  // it's the host the client JUST reached us on, immune to stale build-time
+  // env values. Throttled internally — effectively free on repeated loads.
+  repairMissingQStashSchedules(false, originFromRequest(req) ?? undefined).catch(() => {});
   const notifs = await db.scheduledNotification.findMany({
     where: { userId: user.id },
     orderBy: { createdAt: "desc" },
@@ -72,16 +76,22 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const row = await createReminder(user.id, {
-      type: type as "once" | "daily" | "weekly" | "monthly",
-      time,
-      date: body.date ? String(body.date) : undefined,
-      daysOfWeek: Array.isArray(body.days) ? body.days.map(Number) : undefined,
-      dayOfMonth: body.day_of_month ? Number(body.day_of_month) : undefined,
-      title: body.title ? String(body.title) : "Khata",
-      message: message.trim(),
-      timezone: "Asia/Kolkata",
-    });
+    const row = await createReminder(
+      user.id,
+      {
+        type: type as "once" | "daily" | "weekly" | "monthly",
+        time,
+        date: body.date ? String(body.date) : undefined,
+        daysOfWeek: Array.isArray(body.days) ? body.days.map(Number) : undefined,
+        dayOfMonth: body.day_of_month ? Number(body.day_of_month) : undefined,
+        title: body.title ? String(body.title) : "Khata",
+        message: message.trim(),
+        timezone: "Asia/Kolkata",
+      },
+      // Request-derived origin → QStash destination is ALWAYS the real public
+      // host, regardless of stale/mangled env vars.
+      { baseUrl: originFromRequest(req) ?? undefined }
+    );
     // delivery tells the client how this reminder will actually fire:
     //   "exact" — QStash schedule/publish registered (fires at the exact minute)
     //   "poll"  — no QStash; fires when a server instance is warm
@@ -102,7 +112,9 @@ export async function PATCH(req: NextRequest) {
   const { id, isActive } = await req.json();
   if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
   try {
-    await pauseReminder(user.id, String(id), !!isActive);
+    await pauseReminder(user.id, String(id), !!isActive, {
+      baseUrl: originFromRequest(req) ?? undefined,
+    });
     return NextResponse.json({ ok: true });
   } catch (e: any) {
     return NextResponse.json({ error: e?.message ?? "Couldn't update" }, { status: 400 });

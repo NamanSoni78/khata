@@ -415,7 +415,11 @@ export async function getAccountSummary(userId: string, _args: Args): Promise<st
   );
 }
 
-export async function createScheduledNotification(userId: string, args: Args): Promise<string> {
+export async function createScheduledNotification(
+  userId: string,
+  args: Args,
+  ctx?: { agentType?: string; origin?: string; [k: string]: unknown }
+): Promise<string> {
   // Structured calendar-style args (v2) — the agent NEVER emits cron strings.
   const type = String(args.type ?? "daily") as "once" | "daily" | "weekly" | "monthly";
   const time = String(args.time ?? "");
@@ -448,16 +452,22 @@ export async function createScheduledNotification(userId: string, args: Args): P
   }
 
   try {
-    const row = await createReminder(userId, {
-      type,
-      time,
-      date,
-      daysOfWeek,
-      dayOfMonth,
-      title: args.title ? String(args.title) : "Khata",
-      message,
-      timezone: "Asia/Kolkata",
-    });
+    const row = await createReminder(
+      userId,
+      {
+        type,
+        time,
+        date,
+        daysOfWeek,
+        dayOfMonth,
+        title: args.title ? String(args.title) : "Khata",
+        message,
+        timezone: "Asia/Kolkata",
+      },
+      // ctx.origin is the request-derived public host — QStash destinations
+      // built from it never suffer the stale-env "invalid scheme" 400.
+      { baseUrl: typeof ctx?.origin === "string" ? ctx.origin : undefined }
+    );
     const desc = describeReminder(row);
     const needsSub = !(await db.pushSubscription.count({ where: { userId } }));
     return `Reminder created: "${message}" — ${desc} (ID: ${row.id}).${
@@ -949,7 +959,8 @@ export async function dispatchTool(
     case "get_account_summary": return getAccountSummary(userId, {});
     case "retrieve_transactions": return retrieveTransactions(userId, args);
     case "search_chat_history": return searchChatHistory(userId, args, ctx?.agentType);
-    case "create_scheduled_notification": return createScheduledNotification(userId, args);
+    case "create_scheduled_notification":
+      return createScheduledNotification(userId, args, ctx);
     case "export_data": return exportData(userId, args);
     case "link_transactions": return linkTransactions(userId, args);
     case "mark_event": return markEvent(userId, args);

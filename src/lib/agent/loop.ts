@@ -43,6 +43,8 @@ export async function runAgent(opts: {
   agentType: "daily" | "dashboard";
   config: AgentConfig;
   tools: ToolDefinition[];
+  /** Request-derived public origin — used for QStash reminder destinations. */
+  origin?: string;
 }): Promise<AgentRunResult> {
   const { userId, userMessage, agentType, config, tools } = opts;
 
@@ -89,11 +91,91 @@ export async function runAgent(opts: {
   // If the LLM call fails (bad key, provider down after retries, network),
   // remove the orphan user message so history doesn't show unanswered messages.
   try {
-    return await runAgentInner({ userId, userMessage, agentType, config, tools, history, systemPrompt });
+    return await runAgentInner({ userId, userMessage, agentType, config, tools, history, systemPrompt, origin: opts.origin });
   } catch (e) {
     await db.chatMessage.delete({ where: { id: userMsg.id } }).catch(() => {});
     throw e;
   }
+}
+
+/** Shape of a DB chat row as far as history rebuilding cares. */
+export interface HistoryRowLike {
+  role: string;
+  content: string;
+  metadata?: string | null;
+}
+
+/**
+ * Rebuild the LLM conversation from history rows — with PAIRING INTEGRITY.
+ *
+ * The history window (last N rows) can cut BETWEEN an assistant tool-call
+ * turn and its tool results. Replayed naively, that produces orphaned
+ * `tool` messages ("function call output" with a call_id the endpoint never
+ * saw) or assistant tool_calls with no results — either one makes strict
+ * endpoints 400:
+ *   "No tool call found for function call output with call_id …"
+ * which used to force a silent degrade to JSON-mode tool calling.
+ *
+ * Two-pass rebuild: (a) collect the call_ids declared by assistant messages
+ * AND the call_ids that have tool results in this window; (b) emit tool
+ * messages only when their id was declared by an assistant message INSIDE
+ * the window, and strip toolCall entries whose results were cut off.
+ * Empty assistant shells get dropped.
+ */
+export function rebuildHistoryMessages(
+  history: HistoryRowLike[],
+  systemPrompt: string,
+  userMessage: string
+): ToolkitMessage[] {
+  const declared = new Set<string>(); // ids declared by in-window assistant messages
+  const answered = new Set<string>(); // ids with an in-window tool result
+  for (const h of history) {
+    let meta: any = {};
+    try { meta = JSON.parse(h.metadata || "{}"); } catch { meta = {}; }
+    if (h.role === "assistant" && Array.isArray(meta.toolCalls)) {
+      for (const tc of meta.toolCalls) {
+        if (tc && typeof tc.id === "string") declared.add(tc.id);
+      }
+    } else if (h.role === "tool" && typeof meta.toolCallId === "string") {
+      answered.add(meta.toolCallId);
+    }
+  }
+
+  const messages: ToolkitMessage[] = [{ role: "system", content: systemPrompt }];
+  for (const h of history) {
+    if (h.role === "tool") {
+      let meta: any = {};
+      try { meta = JSON.parse(h.metadata || "{}"); } catch { meta = {}; }
+      // Orphaned by the window cut → its declaring assistant message is
+      // outside the window. Replaying it is exactly what 400s the endpoint.
+      if (typeof meta.toolCallId !== "string" || !declared.has(meta.toolCallId)) continue;
+      messages.push({ role: "tool", content: h.content, toolCallId: meta.toolCallId, name: meta.toolName });
+    } else if (h.role === "assistant") {
+      let meta: any = {};
+      try { meta = JSON.parse(h.metadata || "{}"); } catch { meta = {}; }
+      let toolCalls = Array.isArray(meta.toolCalls) ? meta.toolCalls : undefined;
+      if (toolCalls && toolCalls.length > 0) {
+        // Keep only the calls whose results made it into the window;
+        // strict endpoints require every tool_call_id to be answered.
+        const answeredCalls = toolCalls.filter(
+          (tc: any) => tc && typeof tc.id === "string" && answered.has(tc.id)
+        );
+        toolCalls = answeredCalls.length > 0 ? answeredCalls : undefined;
+      }
+      // Drop empty shells (no text AND no live tool calls) — some endpoints
+      // reject blank assistant messages too.
+      if (!h.content && !toolCalls) continue;
+      messages.push({
+        role: "assistant",
+        content: h.content,
+        toolCalls,
+      });
+    } else {
+      messages.push({ role: h.role as "user" | "system", content: h.content });
+    }
+  }
+  messages.push({ role: "user", content: userMessage });
+  return messages;
 }
 
 async function runAgentInner(opts: {
@@ -104,27 +186,13 @@ async function runAgentInner(opts: {
   tools: ToolDefinition[];
   history: ChatHistoryRow;
   systemPrompt: string;
+  origin?: string;
 }): Promise<AgentRunResult> {
   const { userId, config, tools, history, systemPrompt, userMessage } = opts;
 
-  // 4. Build the conversation in toolkit shape
-  const messages: ToolkitMessage[] = [{ role: "system", content: systemPrompt }];
-  for (const h of history) {
-    if (h.role === "tool") {
-      const meta = JSON.parse(h.metadata || "{}");
-      messages.push({ role: "tool", content: h.content, toolCallId: meta.toolCallId, name: meta.toolName });
-    } else if (h.role === "assistant") {
-      const meta = JSON.parse(h.metadata || "{}");
-      messages.push({
-        role: "assistant",
-        content: h.content,
-        toolCalls: meta.toolCalls,
-      });
-    } else {
-      messages.push({ role: h.role as "user" | "system", content: h.content });
-    }
-  }
-  messages.push({ role: "user", content: userMessage });
+  // 4. Build the conversation in toolkit shape (pairing-integrity rebuild —
+  //    see rebuildHistoryMessages for why this can't be a naive loop).
+  const messages = rebuildHistoryMessages(history, systemPrompt, userMessage);
 
   const runStart = messages.length; // everything appended after this = this run
 
@@ -134,7 +202,9 @@ async function runAgentInner(opts: {
     config,
     messages,
     registry,
-    ctx: { userId, agentType: opts.agentType }, // agentType scopes search_chat_history to this thread
+    // agentType scopes search_chat_history to this thread; origin lets
+    // reminder tools register QStash schedules against the real public host.
+    ctx: { userId, agentType: opts.agentType, origin: opts.origin },
   });
 
   // 6. Persist the turns the SDK appended (assistant tool-call turns and

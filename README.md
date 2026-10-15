@@ -65,7 +65,10 @@ Open http://localhost:3000 → sign up (dev mode shows the OTP on screen when no
 3. **Vercel**: import the repo and set env vars (see `.env.example`):
    - `DATABASE_URL` + `DATABASE_AUTH_TOKEN` (from Turso)
    - `ADMIN_USERNAME` / `ADMIN_PASSWORD`
-   - `NEXT_PUBLIC_APP_URL` = `https://khata.namansoni.in` (scheme optional since V1.1 — a bare `khata.namansoni.in` is auto-normalized to `https://`)
+   - `APP_URL` = `https://khata.namansoni.in` (recommended — runtime-read;
+     `NEXT_PUBLIC_APP_URL` works too but is build-time-inlined on Vercel, so
+     edits need a redeploy. V1.2 derives QStash callback URLs from the live
+     request headers, so notifications no longer depend on either.)
    - `RESEND_API_KEY` (+ optional `RESEND_FROM`)
    - VAPID keys (`bun run gen-vapid`) + `VAPID_SUBJECT`
    - QStash token + signing keys (multi-account supported, `;`-separated)

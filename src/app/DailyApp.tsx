@@ -26,6 +26,14 @@ import Markdown from "@/components/chat/Markdown";
 import { InlineChartReveal, type ChartSpec } from "@/components/charts/InlineChart";
 import AuthScreens, { forgetEmail, getRemembered, type AuthedInfo } from "./components/AuthScreens";
 import { haptic } from "./components/Keypad";
+import {
+  registerServiceWorker,
+  getPushState,
+  ensurePushEnabled,
+  sendTestPush,
+  describeTestResult,
+  currentPermission,
+} from "@/lib/push-client";
 
 type Stage = "auth" | "chat";
 
@@ -178,6 +186,7 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
   const [showSettings, setShowSettings] = useState(false);
   const [pushEnabled, setPushEnabled] = useState(false);
   const [pushSubscribed, setPushSubscribed] = useState(false);
+  const [pushPerm, setPushPerm] = useState<"granted" | "denied" | "default" | "unsupported">("default");
   const [pushLoading, setPushLoading] = useState(false);
   const [voiceLang, setVoiceLang] = useState<string>(() => {
     try { return localStorage.getItem(VOICE_LANG_KEY) ?? "en-IN"; } catch { return "en-IN"; }
@@ -251,6 +260,25 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
     installPromptRef.current = null;
     setCanInstall(false);
   };
+
+  /* ---------- service worker + push state on mount ----------
+     THE fix for "Enable notifications / Send test doing nothing":
+     public/sw.js was never registered anywhere, so `serviceWorker.ready`
+     hung forever and no subscription could ever be created. Register it on
+     every boot (idempotent), then reflect this device's real subscription
+     state in the settings sheet (previously the button always showed
+     "Enable notifications" again after every reload). */
+  useEffect(() => {
+    registerServiceWorker();
+    let active = true;
+    (async () => {
+      const state = await getPushState();
+      if (!active) return;
+      setPushSubscribed(state.subscribed && state.permission === "granted");
+      setPushPerm(state.permission);
+    })();
+    return () => { active = false; };
+  }, []);
 
   /* ---------- load profile + history on mount ---------- */
   useEffect(() => {
@@ -687,6 +715,12 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
             i === m.length - 1 ? { ...mm, content: j.reply || "Done.", pending: false, chartSpec: j.chartSpec ?? null } : mm
           )
         );
+        // The moment a reminder gets created through chat ("remind me at
+        // 8pm daily…"), ask for notification permission IMMEDIATELY — the
+        // reminder is useless unless this device can actually receive it.
+        if (Array.isArray(j.toolCalls) && j.toolCalls.some((c: any) => c?.name === "create_scheduled_notification")) {
+          promptForPushIfNeeded();
+        }
       }
     } catch (e: any) {
       toast.error(e?.message ?? "Network error");
@@ -752,31 +786,42 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
     } catch { /* best-effort */ }
   };
 
-  const subscribeToPush = async () => {
-    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
-      toast.error("This browser doesn't support notifications");
-      return;
-    }
+  /**
+   * Ask for permission + subscribe this device the moment the user sets ANY
+   * notification (chat-created reminder, settings toggle). Idempotent — if
+   * this device is already subscribed nothing visible happens.
+   */
+  const promptForPushIfNeeded = async () => {
+    if (pushLoading) return; // a flow is already running
+    const state = await getPushState();
+    if (!state.supported) return;
+    if (state.subscribed && currentPermission() === "granted") return;
     setPushLoading(true);
     try {
-      const reg = await navigator.serviceWorker.ready;
-      const keyRes = await fetch("/api/notifications/vapid-public-key");
-      if (!keyRes.ok) throw new Error("Push isn't configured on this deployment");
-      const { publicKey } = await keyRes.json();
-      const sub = await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: publicKey,
-      });
-      const res = await fetch("/api/notifications/subscribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(sub.toJSON()),
-      });
-      if (!res.ok) throw new Error("Couldn't save the subscription");
-      setPushSubscribed(true);
-      toast.success("Notifications on 🔔");
-    } catch (e: any) {
-      toast.error(e?.message ?? "Couldn't enable notifications");
+      const r = await ensurePushEnabled();
+      if (r.ok) {
+        setPushSubscribed(true);
+        if (r.stage === "enabled") toast.success(r.detail);
+      } else if (r.stage === "permission-denied") {
+        toast.error(r.detail, { duration: 7000 });
+      }
+      // permission-dismissed / other stages: silent — the user can always
+      // use the explicit "Enable notifications" button in settings.
+    } finally {
+      setPushLoading(false);
+    }
+  };
+
+  const subscribeToPush = async () => {
+    setPushLoading(true);
+    try {
+      const r = await ensurePushEnabled();
+      if (r.ok) {
+        setPushSubscribed(true);
+        toast.success(r.detail);
+      } else {
+        toast.error(r.detail, { duration: r.stage === "permission-denied" ? 8000 : 5000 });
+      }
     } finally {
       setPushLoading(false);
     }
@@ -785,10 +830,11 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
   const sendTestNotification = async () => {
     setPushLoading(true);
     try {
-      const res = await fetch("/api/notifications/test", { method: "POST" });
-      const j = await res.json();
-      if (res.ok) toast.success("Sent! Check your notifications");
-      else toast.error(j.error ?? "Couldn't send the test");
+      const r = await sendTestPush();
+      const d = describeTestResult(r);
+      if (d.kind === "ok") toast.success(d.text);
+      else if (d.kind === "warn") toast.warning(d.text, { duration: 6000 });
+      else toast.error(d.text);
     } finally {
       setPushLoading(false);
     }
@@ -1091,14 +1137,22 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
                     </button>
                   </div>
                 ) : (
-                  <button
-                    onClick={subscribeToPush}
-                    disabled={pushLoading}
-                    className="press h-9 px-4 rounded-xl bg-[var(--primary)] text-white text-xs font-medium flex items-center gap-2 disabled:opacity-60"
-                  >
-                    {pushLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
-                    Enable notifications
-                  </button>
+                  <div>
+                    <button
+                      onClick={subscribeToPush}
+                      disabled={pushLoading}
+                      className="press h-9 px-4 rounded-xl bg-[var(--primary)] text-white text-xs font-medium flex items-center gap-2 disabled:opacity-60"
+                    >
+                      {pushLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null}
+                      Enable notifications
+                    </button>
+                    {pushPerm === "denied" && (
+                      <p className="text-[11px] text-destructive/90 leading-relaxed mt-2">
+                        Notifications are blocked for this site. Tap the lock icon next to the address bar →
+                        Notifications → Allow, then reload and enable again.
+                      </p>
+                    )}
+                  </div>
                 )}
                 <p className="text-[11px] text-muted-foreground/70 mt-3">
                   Tip: ask me things like &quot;remind me at 8pm daily&quot; or &quot;send my day&apos;s summary at 9:10pm&quot;.

@@ -72,19 +72,25 @@ export async function sendPush(
 
 /**
  * Send a push notification to ALL subscriptions for a user.
+ * `errors` carries the first failure reasons (capped) so callers can tell
+ * the user WHY a device didn't receive a push instead of guessing.
  */
 export async function sendPushToUser(
   userId: string,
   payload: { title: string; body: string; url?: string }
-): Promise<{ sent: number; failed: number }> {
+): Promise<{ sent: number; failed: number; errors?: string[] }> {
   const subs = await db.pushSubscription.findMany({ where: { userId } });
   let sent = 0, failed = 0;
+  const errors: string[] = [];
   for (const s of subs) {
     const r = await sendPush(s.id, payload);
     if (r.ok) sent++;
-    else failed++;
+    else {
+      failed++;
+      if (r.error) errors.push(r.error);
+    }
   }
-  return { sent, failed };
+  return { sent, failed, errors: errors.slice(0, 3) };
 }
 
 /**

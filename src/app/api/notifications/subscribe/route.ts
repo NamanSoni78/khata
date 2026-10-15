@@ -8,8 +8,13 @@ export async function POST(req: NextRequest) {
   if (!isWebPushConfigured()) {
     return NextResponse.json({ error: "Web Push not configured (admin must set VAPID env vars)" }, { status: 503 });
   }
-  const token = await getSessionToken("daily");
-  const user = await getSessionUser(token, "daily");
+  // EITHER session: devices get subscribed from the daily app's settings
+  // sheet AND from the dashboard's reminders tab (both ask for permission
+  // the moment the user sets any notification).
+  let user = await getSessionUser(await getSessionToken("daily"), "daily");
+  if (!user || user.id === "admin") {
+    user = await getSessionUser(await getSessionToken("dashboard"), "dashboard");
+  }
   if (!user || user.id === "admin") {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
@@ -30,8 +35,10 @@ export async function DELETE(req: NextRequest) {
   if (!isWebPushConfigured()) {
     return NextResponse.json({ error: "Web Push not configured" }, { status: 503 });
   }
-  const token = await getSessionToken("daily");
-  const user = await getSessionUser(token, "daily");
+  let user = await getSessionUser(await getSessionToken("daily"), "daily");
+  if (!user || user.id === "admin") {
+    user = await getSessionUser(await getSessionToken("dashboard"), "dashboard");
+  }
   if (!user || user.id === "admin") {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }

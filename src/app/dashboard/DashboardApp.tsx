@@ -8,12 +8,20 @@ import {
 import {
   TrendingUp, Download, LogOut, ArrowLeft, Users,
   RefreshCw, Bell, Plus, Trash2, FileText, Moon, Sun, Settings as SettingsIcon,
-  Loader2, Upload, Copy, CalendarDays, MessageSquareText,
+  Loader2, Upload, Copy, CalendarDays, MessageSquareText, CheckCheck,
 } from "lucide-react";
 import { MultiPeriodChart } from "@/components/dashboard/MultiPeriodChart";
 import DeepDiveChat from "@/components/dashboard/DeepDiveChat";
 import MindmapEditor from "@/components/mindmap/MindmapEditor";
 import ImportDialog from "@/components/dashboard/ImportDialog";
+import {
+  registerServiceWorker,
+  getPushState,
+  ensurePushEnabled,
+  sendTestPush,
+  describeTestResult,
+  type PushState,
+} from "@/lib/push-client";
 
 const PIE_COLORS = [
   "#00a884", "#f0a500", "#ff6b6b", "#7c8696", "#25d366", "#d97706", "#db2777",
@@ -697,8 +705,51 @@ function NotificationsCard() {
   const [dayOfMonth, setDayOfMonth] = useState(1);
   const [message, setMessage] = useState("Time to log your transactions!");
   const [loading, setLoading] = useState(false);
+  const [testing, setTesting] = useState(false);
+  // This device's push readiness — reminders only actually arrive on
+  // devices that granted permission + subscribed.
+  const [pushState, setPushState] = useState<PushState | null>(null);
 
   const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
+
+  // Register the service worker + read this device's real push state.
+  // (sw.js registration was previously missing app-wide — which is why
+  // enabling/testing notifications silently did nothing.)
+  useEffect(() => {
+    registerServiceWorker();
+    let active = true;
+    (async () => {
+      const s = await getPushState();
+      if (active) setPushState(s);
+    })();
+    return () => { active = false; };
+  }, []);
+
+  /**
+   * THE requirement: the moment the user sets ANY notification (Schedule
+   * button or Resume toggle), immediately ask for the PERMANENT browser
+   * notification permission and subscribe this device. Runs inside the
+   * click handler so the prompt is shown from a genuine user gesture.
+   * Returns true when this device can receive notifications afterwards.
+   */
+  const ensureDeviceNotified = async (): Promise<boolean> => {
+    const state = await getPushState();
+    setPushState(state);
+    if (!state.supported) return false;
+    if (state.subscribed && state.permission === "granted") return true;
+    const r = await ensurePushEnabled();
+    setPushState(await getPushState());
+    if (r.ok) {
+      if (r.stage === "enabled") toast.success(r.detail);
+      return true;
+    }
+    if (r.stage === "permission-denied") {
+      toast.error(r.detail, { duration: 8000 });
+    } else if (r.stage !== "permission-dismissed") {
+      toast.warning(r.detail, { duration: 6000 });
+    }
+    return false;
+  };
 
   const load = async () => {
     const res = await fetch("/api/dashboard/notifications");
@@ -720,6 +771,10 @@ function NotificationsCard() {
   }, []);
 
   const create = async () => {
+    // Ask for notification permission FIRST — the reminder being scheduled
+    // is only useful if this device can actually receive it. The permission
+    // prompt fires inside this click gesture, which iOS Safari requires.
+    await ensureDeviceNotified();
     setLoading(true);
     try {
       const res = await fetch("/api/dashboard/notifications", {
@@ -736,7 +791,11 @@ function NotificationsCard() {
       });
       const j = await res.json();
       if (res.ok) {
-        toast.success(`Reminder scheduled — ${j.description ?? ""}`);
+        toast.success(
+          `Reminder scheduled — ${j.description ?? ""}${
+            j.delivery === "exact" ? " (fires at the exact minute)" : ""
+          }`
+        );
         setMessage("Time to log your transactions!");
         load();
       } else {
@@ -748,12 +807,29 @@ function NotificationsCard() {
   };
 
   const toggle = async (id: string, isActive: boolean) => {
+    if (isActive) {
+      // Resuming a reminder = (re)enabling notifications on this device.
+      await ensureDeviceNotified();
+    }
     await fetch("/api/dashboard/notifications", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id, isActive }),
     });
     load();
+  };
+
+  const sendTest = async () => {
+    setTesting(true);
+    try {
+      const r = await sendTestPush();
+      const d = describeTestResult(r);
+      if (d.kind === "ok") toast.success(d.text);
+      else if (d.kind === "warn") toast.warning(d.text, { duration: 6000 });
+      else toast.error(d.text);
+    } finally {
+      setTesting(false);
+    }
   };
 
   const remove = async (id: string) => {
@@ -776,6 +852,33 @@ function NotificationsCard() {
         </p>
       </div>
       <div className="px-5 pb-5 space-y-3">
+        {/* This device's delivery status + test button */}
+        <div className="flex items-center justify-between gap-2 p-3 bg-muted/50 border border-border rounded-xl">
+          {pushState === null ? (
+            <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" /> Checking notifications on this device…
+            </span>
+          ) : !pushState.supported ? (
+            <span className="text-xs text-muted-foreground">This browser can&apos;t receive notifications.</span>
+          ) : pushState.subscribed && pushState.permission === "granted" ? (
+            <span className="text-xs text-emerald-600 dark:text-emerald-400 font-medium flex items-center gap-1.5">
+              <CheckCheck className="w-3.5 h-3.5" /> Enabled on this device
+            </span>
+          ) : pushState.permission === "denied" ? (
+            <span className="text-xs text-destructive font-medium">Blocked — unblock in browser site settings</span>
+          ) : (
+            <span className="text-xs text-muted-foreground">Not enabled on this device yet</span>
+          )}
+          <button
+            onClick={sendTest}
+            disabled={testing}
+            className="press h-7 px-2.5 rounded-lg border border-input text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors disabled:opacity-60 shrink-0 flex items-center gap-1.5"
+          >
+            {testing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Bell className="w-3 h-3" />}
+            Send test
+          </button>
+        </div>
+
         <div className="space-y-3 p-4 bg-muted/50 border border-border rounded-xl">
           {/* Repeat type */}
           <div className="flex items-center gap-1.5">
@@ -929,7 +1032,7 @@ function NotificationsCard() {
           )}
         </div>
         <p className="text-[11px] text-muted-foreground/70 pt-1">
-          Reminders arrive as push notifications on devices where you&apos;ve enabled them (daily app → Settings). You can also ask the assistant — e.g. &quot;remind me at 9:10pm daily with today&apos;s totals&quot;.
+          Setting a reminder automatically asks for notification permission on this device. Reminders arrive on every device where you&apos;ve enabled them. You can also ask the assistant — e.g. &quot;remind me at 9:10pm daily with today&apos;s totals&quot;.
         </p>
       </div>
     </div>

@@ -9,6 +9,7 @@ import { resolveDailyAgentConfig, resolveDashboardAgentConfig } from "@/lib/user
 import { runAgent } from "@/lib/agent/loop";
 import { DAILY_TOOLS, DASHBOARD_TOOLS } from "@/lib/agent/tools-defs";
 import { extractChartMarker } from "@/lib/agent/chart-marker";
+import { originFromRequest } from "@/lib/app-url";
 import { db } from "@/lib/db";
 
 async function getDailyUser() {
@@ -140,7 +141,18 @@ export async function POST(req: NextRequest) {
 
   try {
     const startedAt = Date.now();
-    const result = await runAgent({ userId, userMessage: message, agentType, config, tools });
+    // Request-derived origin → any reminder the agent creates via the
+    // create_scheduled_notification tool registers its QStash schedule
+    // against the REAL public host (x-forwarded-host/proto), immune to
+    // stale/mangled NEXT_PUBLIC_APP_URL env values.
+    const result = await runAgent({
+      userId,
+      userMessage: message,
+      agentType,
+      config,
+      tools,
+      origin: originFromRequest(req) ?? undefined,
+    });
 
     // Optional admin-configurable minimum reply delay (uxConfig.replyDelayMs).
     // Keeps the typing indicator visible long enough on very fast models.

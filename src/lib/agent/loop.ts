@@ -61,22 +61,29 @@ export async function runAgent(opts: {
   } catch { /* instructions are best-effort */ }
 
   // 2. Load history (admin-configurable window; older turns stay reachable
-  //    via the search_chat_history tool — effectively infinite context)
+  //    via the search_chat_history tool — effectively infinite context).
+  //    Each agent only sees ITS OWN conversation: the daily chat and the
+  //    dashboard analysis chat are separate threads (home app never shows
+  //    dashboard-agent history and vice versa).
   const schemaMode = await getSchemaMode();
   const historyLimit =
     typeof (schemaMode as { chatHistoryLimit?: number }).chatHistoryLimit === "number"
       ? Math.max(4, Math.min(80, (schemaMode as { chatHistoryLimit: number }).chatHistoryLimit))
       : DEFAULT_HISTORY_LIMIT;
+  const sourceFilter =
+    agentType === "dashboard"
+      ? { metadata: { contains: '"source":"dashboard"' } } // dashboard agent: only its own thread
+      : { NOT: { metadata: { contains: '"source":"dashboard"' } } }; // daily: everything except dashboard turns (legacy rows default to daily)
   const history = await db.chatMessage.findMany({
-    where: { userId },
+    where: { userId, ...sourceFilter },
     orderBy: { createdAt: "desc" },
     take: historyLimit,
   });
   history.reverse();
 
-  // 3. Persist the new user message
+  // 3. Persist the new user message (tagged with its source thread)
   const userMsg = await db.chatMessage.create({
-    data: { userId, role: "user", content: userMessage, metadata: "{}" },
+    data: { userId, role: "user", content: userMessage, metadata: JSON.stringify({ source: agentType }) },
   });
 
   // If the LLM call fails (bad key, provider down after retries, network),
@@ -127,7 +134,7 @@ async function runAgentInner(opts: {
     config,
     messages,
     registry,
-    ctx: { userId },
+    ctx: { userId, agentType: opts.agentType }, // agentType scopes search_chat_history to this thread
   });
 
   // 6. Persist the turns the SDK appended (assistant tool-call turns and
@@ -139,7 +146,7 @@ async function runAgentInner(opts: {
           userId,
           role: "assistant",
           content: m.content, // already sanitized by the SDK
-          metadata: JSON.stringify({ toolCalls: m.toolCalls }),
+          metadata: JSON.stringify({ toolCalls: m.toolCalls, source: opts.agentType }),
         },
       });
     } else if (m.role === "tool") {
@@ -148,7 +155,7 @@ async function runAgentInner(opts: {
           userId,
           role: "tool",
           content: m.content,
-          metadata: JSON.stringify({ toolCallId: m.toolCallId, toolName: m.name }),
+          metadata: JSON.stringify({ toolCallId: m.toolCallId, toolName: m.name, source: opts.agentType }),
         },
       });
     }
@@ -159,6 +166,7 @@ async function runAgentInner(opts: {
   const finalText = result.finalContent || "(no response)";
   await persistFinalAssistantMessage(userId, finalText, {
     toolCalls: [],
+    source: opts.agentType,
   });
 
   // 8. Post-processing: auto-link multi-leg txns
@@ -167,7 +175,7 @@ async function runAgentInner(opts: {
   // 9. Extract chart marker (if the agent offered a chart)
   const { cleanText, chartSpec } = extractChartMarker(finalText);
   if (chartSpec) {
-    await attachChartSpecToLastMessage(userId, chartSpec);
+    await attachChartSpecToLastMessage(userId, opts.agentType, chartSpec);
   }
 
   if (result.diagnostics.length > 0) {
@@ -199,10 +207,14 @@ async function persistFinalAssistantMessage(
   });
 }
 
-/** Attach a parsed chart spec to the most recent assistant message. */
-async function attachChartSpecToLastMessage(userId: string, chartSpec: ChartSpec): Promise<void> {
+/** Attach a parsed chart spec to the most recent assistant message of the SAME thread. */
+async function attachChartSpecToLastMessage(userId: string, source: "daily" | "dashboard", chartSpec: ChartSpec): Promise<void> {
+  const sourceFilter =
+    source === "dashboard"
+      ? { metadata: { contains: '"source":"dashboard"' } }
+      : { NOT: { metadata: { contains: '"source":"dashboard"' } } };
   const last = await db.chatMessage.findFirst({
-    where: { userId, role: "assistant" },
+    where: { userId, role: "assistant", ...sourceFilter },
     orderBy: { createdAt: "desc" },
   });
   if (!last) return;

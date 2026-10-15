@@ -20,7 +20,7 @@ import { toast } from "sonner";
 import {
   Mic, Send, LogOut, Loader2, Paperclip, Settings as SettingsIcon,
   Moon, Sun, BarChart3, WifiOff, CheckCheck, Clock3, X, Download,
-  Languages, ImageIcon, ChevronUp, Loader, ChevronDown, Trash2, Bot,
+  Languages, ImageIcon, ChevronDown, Trash2, Bot,
 } from "lucide-react";
 import Markdown from "@/components/chat/Markdown";
 import { InlineChartReveal, type ChartSpec } from "@/components/charts/InlineChart";
@@ -158,7 +158,6 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
   const [sending, setSending] = useState(false);
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
-  const [loadingOlder, setLoadingOlder] = useState(false);
   const [showJumpDown, setShowJumpDown] = useState(false);
 
   // voice
@@ -193,8 +192,6 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
   const inputRef = useRef("");
   const recognitionRef = useRef<any>(null);
   const recTimerRef = useRef<number | null>(null);
-  const holdTimerRef = useRef<number | null>(null);
-  const heldRef = useRef(false);
   const listeningRef = useRef(false);
   const baseTextRef = useRef("");            // input text when recording started
   const committedRef = useRef("");           // finalized transcript of prior sessions
@@ -203,6 +200,8 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const cancelRecordingRef = useRef(false);
+  const stopIntentRef = useRef(false);        // user requested stop — onend must NOT auto-restart
+  const sendAfterStopRef = useRef(false);     // auto-send the final transcript when it lands
   const installPromptRef = useRef<any>(null);
   const nearBottomRef = useRef(true);
 
@@ -257,43 +256,49 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
   useEffect(() => {
     let active = true;
     (async () => {
-      try {
-        const res = await fetch("/api/auth/me");
-        if (!res.ok) return;
+      // Fire profile + history together — the two calls are independent,
+      // so the chat paints in one round-trip instead of two.
+      const meP = fetch("/api/auth/me").then(async (res) => {
+        if (!res.ok) return null;
         const j = await res.json();
-        if (!active || !j.authenticated) return;
-        if (typeof j.sttEngine === "string") setSttEngine(j.sttEngine);
-        if (j.flags) {
-          setPdfUploadEnabled(j.flags.pdfUpload !== false);
-          setOcrEnabled(j.flags.ocr === true);
-          setPushEnabled(j.flags.webPush !== false);
-        }
-        if (j.prefs) {
-          if (typeof j.prefs.wallpaper === "string" && WALLPAPERS[j.prefs.wallpaper]) setWallpaper(j.prefs.wallpaper);
-          if (typeof j.prefs.voiceLang === "string") setVoiceLang(j.prefs.voiceLang);
-        }
-      } catch { /* offline — defaults */ }
+        return j?.authenticated ? j : null;
+      }).catch(() => null);
+      // The home app shows the LATEST 50 messages — the full archive is
+      // exportable from the dashboard ("Export chat history").
+      const histP = fetch("/api/chat?action=history&limit=50")
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null);
 
-      try {
-        const hres = await fetch("/api/chat?action=history&limit=100");
-        if (hres.ok && active) {
-          const hj = await hres.json();
-          if (Array.isArray(hj.messages)) {
-            setMessages(
-              hj.messages.map((m: any) => ({
-                id: `h_${m.ts}_${Math.random().toString(36).slice(2, 6)}`,
-                role: m.role,
-                content: m.content,
-                ts: m.ts,
-                chartSpec: m.chartSpec ?? null,
-              }))
-            );
-            setHasMoreHistory(!!hj.hasMore);
-            requestAnimationFrame(() => scrollToBottom("auto"));
-          }
+      const [me, hj] = await Promise.all([meP, histP]);
+      if (!active) return;
+
+      if (me) {
+        if (typeof me.sttEngine === "string") setSttEngine(me.sttEngine);
+        if (me.flags) {
+          setPdfUploadEnabled(me.flags.pdfUpload !== false);
+          setOcrEnabled(me.flags.ocr === true);
+          setPushEnabled(me.flags.webPush !== false);
         }
-      } catch { /* history is best-effort */ }
-      if (active) setHistoryLoaded(true);
+        if (me.prefs) {
+          if (typeof me.prefs.wallpaper === "string" && WALLPAPERS[me.prefs.wallpaper]) setWallpaper(me.prefs.wallpaper);
+          if (typeof me.prefs.voiceLang === "string") setVoiceLang(me.prefs.voiceLang);
+        }
+      }
+
+      if (hj && Array.isArray(hj.messages)) {
+        setMessages(
+          hj.messages.map((m: any) => ({
+            id: `h_${m.ts}_${Math.random().toString(36).slice(2, 6)}`,
+            role: m.role,
+            content: m.content,
+            ts: m.ts,
+            chartSpec: m.chartSpec ?? null,
+          }))
+        );
+        setHasMoreHistory(!!hj.hasMore);
+        requestAnimationFrame(() => scrollToBottom("auto"));
+      }
+      setHistoryLoaded(true);
     })();
     return () => { active = false; };
   }, []);
@@ -310,7 +315,6 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
     nearBottomRef.current = nearBottom;
     setShowJumpDown(!nearBottom && el.scrollHeight > el.clientHeight + 200);
-    if (el.scrollTop < 80) loadOlderMessages();
   }, []);
 
   useEffect(() => {
@@ -319,43 +323,9 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
     }
   }, [messages.length, sending]);
 
-  /* ---------- history pagination (scroll up) ---------- */
-  const loadOlderMessages = useCallback(async () => {
-    if (loadingOlder || !hasMoreHistory || messages.length === 0) return;
-    const oldest = messages.find((m) => m.id.startsWith("h_")) ?? messages[0];
-    if (!oldest) return;
-    setLoadingOlder(true);
-    const main = scrollMainRef.current;
-    const prevHeight = main?.scrollHeight ?? 0;
-    try {
-      const res = await fetch(`/api/chat?action=history&limit=100&before=${encodeURIComponent(oldest.ts)}`);
-      if (res.ok) {
-        const j = await res.json();
-        if (Array.isArray(j.messages) && j.messages.length > 0) {
-          setMessages((m) => [
-            ...j.messages.map((mm: any) => ({
-              id: `h_${mm.ts}_${Math.random().toString(36).slice(2, 6)}`,
-              role: mm.role,
-              content: mm.content,
-              ts: mm.ts,
-              chartSpec: mm.chartSpec ?? null,
-            })),
-            ...m,
-          ]);
-          setHasMoreHistory(!!j.hasMore);
-          // keep scroll position stable
-          requestAnimationFrame(() => {
-            const el = scrollMainRef.current;
-            if (el) el.scrollTop = el.scrollHeight - prevHeight;
-          });
-        } else {
-          setHasMoreHistory(false);
-        }
-      }
-    } catch { /* best-effort */ } finally {
-      setLoadingOlder(false);
-    }
-  }, [loadingOlder, hasMoreHistory, messages]);
+  /* NOTE: no scroll-up pagination here by design — the home app shows the
+     latest 50 messages; anything older is exported from the dashboard
+     ("Export chat history" downloads the complete transcript). */
 
   /* ---------- offline queue ---------- */
   const flushQueue = useCallback(async () => {
@@ -432,11 +402,11 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
   }, [input]);
 
   /* ============================================================
-     SPEECH TO TEXT — NATIVE (duplication-proof)
+     SPEECH TO TEXT — NATIVE (duplication-proof + stoppable)
      Strategy: rebuild the current session's transcript from ALL results
      on every event (idempotent — duplicate events can't re-append text),
      fold finals into `committed` only when the session ends, and restart
-     with a listeningRef (not stale state) so auto-restart works.
+     on silence ONLY while the user hasn't asked to stop (stopIntentRef).
      ============================================================ */
   const appendDedupe = (base: string, add: string): string => {
     const a = add.trim();
@@ -461,6 +431,7 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
     baseTextRef.current = inputRef.current;
     committedRef.current = "";
     sessionFinalRef.current = "";
+    stopIntentRef.current = false;
 
     rec.onresult = (e: any) => {
       // REBUILD from scratch every event — immune to resultIndex quirks,
@@ -479,22 +450,32 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
 
     rec.onerror = (e: any) => {
       if (e.error !== "no-speech" && e.error !== "aborted") toast.error(`Voice error: ${e.error}`);
-      stopRecordingUI();
+      if (recognitionRef.current === rec) stopRecordingUI();
     };
 
     rec.onend = () => {
       // fold this session's finals into the committed transcript
       committedRef.current = appendDedupe(committedRef.current, sessionFinalRef.current);
       sessionFinalRef.current = "";
-      if (recognitionRef.current === rec && listeningRef.current) {
+
+      // auto-restart ONLY while still listening AND the user hasn't stopped us
+      if (recognitionRef.current === rec && listeningRef.current && !stopIntentRef.current) {
         try {
           rec.start();
           return;
-        } catch { /* fall through to stop */ }
+        } catch { /* fall through to finalize */ }
       }
       if (recognitionRef.current === rec) {
-        setInput(baseTextRef.current ? baseTextRef.current.trim() + " " + committedRef.current.trim() : committedRef.current.trim());
-        stopRecordingUI();
+        const finalText = (
+          baseTextRef.current ? baseTextRef.current.trim() + " " + committedRef.current.trim() : committedRef.current.trim()
+        ).trim();
+        setInput(finalText);
+        if (stopIntentRef.current) {
+          recognitionRef.current = null;
+          finalizeAfterStop(finalText);
+        } else {
+          stopRecordingUI();
+        }
       }
     };
 
@@ -509,7 +490,20 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
   };
 
   const stopNativeListening = () => {
+    stopIntentRef.current = true;
     try { recognitionRef.current?.stop(); } catch { /* already stopped */ }
+    // Safety net: if onend never fires (engine quirk), finalize after 350ms
+    const rec = recognitionRef.current;
+    window.setTimeout(() => {
+      if (recognitionRef.current === rec) {
+        recognitionRef.current = null;
+        const finalText = (
+          baseTextRef.current ? baseTextRef.current.trim() + " " + committedRef.current.trim() : committedRef.current.trim()
+        ).trim();
+        setInput(finalText);
+        finalizeAfterStop(finalText);
+      }
+    }, 350);
   };
 
   /* ============================================================
@@ -533,7 +527,10 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
         stream.getTracks().forEach((t) => t.stop());
         mediaStreamRef.current = null;
         mediaRecorderRef.current = null;
-        if (cancelRecordingRef.current) { stopRecordingUI(); return; }
+        if (cancelRecordingRef.current) {
+          stopRecordingUI();
+          return;
+        }
         const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
         if (blob.size < 1200) { // too short — likely a mis-tap
           stopRecordingUI();
@@ -550,8 +547,14 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
             toast.error(j.error ?? "Transcription failed");
           } else if (j.text) {
             const prefix = inputRef.current ? inputRef.current.trim() + " " : "";
-            setInput(prefix + j.text);
-            setTimeout(() => textareaRef.current?.focus(), 60);
+            const finalText = (prefix + j.text).trim();
+            setInput(finalText);
+            if (sendAfterStopRef.current) {
+              sendAfterStopRef.current = false;
+              if (finalText) void sendMessageText(finalText);
+            } else {
+              setTimeout(() => textareaRef.current?.focus(), 60);
+            }
           }
         } catch {
           toast.error("Transcription failed — check your connection");
@@ -563,6 +566,7 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
       mediaStreamRef.current = stream;
       mediaRecorderRef.current = recorder;
       baseTextRef.current = inputRef.current;
+      stopIntentRef.current = false;
       recorder.start(250);
       startRecordingUI();
     } catch (e: any) {
@@ -592,16 +596,28 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
     setTimeout(() => textareaRef.current?.focus(), 60);
   };
 
+  /** After a user-requested stop: auto-send when requested, else focus composer. */
+  const finalizeAfterStop = (finalText: string) => {
+    const wantsSend = sendAfterStopRef.current;
+    sendAfterStopRef.current = false;
+    stopRecordingUI();
+    if (wantsSend && finalText.trim()) {
+      void sendMessageText(finalText.trim());
+    }
+  };
+
   const startListening = () => {
     if (sttEngine === "openai-compatible") void startServerListening();
     else startNativeListening();
   };
-  const stopListening = (cancel = false) => {
-    if (sttEngine === "openai-compatible") stopServerListening(cancel);
+  const stopListening = (opts: { send?: boolean } = {}) => {
+    sendAfterStopRef.current = !!opts.send;
+    if (sttEngine === "openai-compatible") stopServerListening(false);
     else stopNativeListening();
   };
 
   const cancelRecording = () => {
+    sendAfterStopRef.current = false;
     if (sttEngine === "openai-compatible") {
       stopServerListening(true);
     } else {
@@ -609,35 +625,27 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
       setInput(baseTextRef.current);
       committedRef.current = "";
       sessionFinalRef.current = "";
+      stopIntentRef.current = true;
       stopNativeListening();
       stopRecordingUI();
     }
   };
 
-  /* ---------- mic press-and-hold / tap ---------- */
-  const onMicPointerDown = () => {
-    heldRef.current = false;
-    holdTimerRef.current = window.setTimeout(() => {
-      heldRef.current = true;
-      if (!listeningRef.current) startListening();
-    }, 280);
-  };
-  const onMicPointerUp = () => {
-    if (holdTimerRef.current) { clearTimeout(holdTimerRef.current); holdTimerRef.current = null; }
-    if (heldRef.current) {
-      if (listeningRef.current) stopListening();
-    } else {
-      if (listeningRef.current) stopListening();
-      else startListening();
-    }
-  };
-  const onMicPointerLeave = () => {
-    if (holdTimerRef.current) { clearTimeout(holdTimerRef.current); holdTimerRef.current = null; }
+  /* ---------- mic: simple tap-to-toggle ---------- */
+  const onMicClick = () => {
+    if (listening || transcribing) return; // pill buttons take over
+    startListening();
   };
 
   /* ---------- send message ---------- */
   const sendMessage = async () => {
     const text = input.trim();
+    if (!text || sending) return;
+    setInput("");
+    await sendMessageText(text);
+  };
+
+  const sendMessageText = async (text: string) => {
     if (!text || sending) return;
     haptic(10);
 
@@ -1133,18 +1141,12 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
         style={{ minHeight: 0 }}
       >
         <div className="max-w-2xl mx-auto px-3.5 py-3">
-          {loadingOlder && (
-            <div className="flex items-center justify-center gap-1.5 text-[11px] text-muted-foreground py-1">
-              <Loader className="w-3 h-3 animate-spin" /> loading earlier messages…
+          {hasMoreHistory && historyLoaded && messages.length > 0 && (
+            <div className="flex justify-center pb-1.5">
+              <span className="date-chip !normal-case">
+                Showing your last 50 messages · full history exports from Dashboard
+              </span>
             </div>
-          )}
-          {hasMoreHistory && !loadingOlder && (
-            <button
-              onClick={loadOlderMessages}
-              className="press mx-auto flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground py-1"
-            >
-              <ChevronUp className="w-3 h-3" /> load earlier messages
-            </button>
           )}
 
           {!historyLoaded && (
@@ -1186,7 +1188,7 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
                 ))}
               </div>
               <p className="text-[11px] text-muted-foreground/70 mt-5 flex items-center justify-center gap-1.5">
-                <Mic className="w-3 h-3" /> Hold the mic to speak
+                <Mic className="w-3 h-3" /> Tap the mic to speak
               </p>
             </div>
           )}
@@ -1219,19 +1221,19 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
           />
 
           {listening || transcribing ? (
-            /* --- WhatsApp-style recording pill --- */
+            /* --- WhatsApp-style recording pill (remade) --- */
             <>
               <button
                 type="button"
                 onClick={cancelRecording}
                 disabled={transcribing}
                 className="pill-btn pill-btn-ghost shrink-0"
-                title="Cancel recording"
-                aria-label="Cancel recording"
+                title="Discard recording"
+                aria-label="Discard recording"
               >
                 <Trash2 className="w-5 h-5" />
               </button>
-              <div className="composer flex-1 !items-center gap-3 overflow-hidden anim-pop-in">
+              <div className="composer flex-1 !items-center gap-3 overflow-hidden anim-pop-in" title={input}>
                 <span className="relative flex h-2.5 w-2.5 shrink-0">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-destructive opacity-60" />
                   <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-destructive" />
@@ -1239,10 +1241,17 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
                 <span className="text-sm font-medium text-foreground tnum w-11 shrink-0">
                   {Math.floor(recSeconds / 60)}:{String(recSeconds % 60).padStart(2, "0")}
                 </span>
-                <div className="flex-1 flex items-center justify-center gap-[3px] h-5" aria-hidden>
-                  {Array.from({ length: 9 }).map((_, i) => (
-                    <span key={i} className="sound-wave-bar" style={{ animationDelay: `${(i % 5) * 0.11}s` }} />
-                  ))}
+                {/* live transcript preview (native STT) or waveform */}
+                <div className="flex-1 min-w-0 flex items-center h-5" aria-hidden>
+                  {input.trim() && !transcribing ? (
+                    <span className="text-[12.5px] text-muted-foreground truncate">{input.trim()}</span>
+                  ) : (
+                    <div className="flex-1 flex items-center justify-center gap-[3px]">
+                      {Array.from({ length: 9 }).map((_, i) => (
+                        <span key={i} className="sound-wave-bar" style={{ animationDelay: `${(i % 5) * 0.11}s` }} />
+                      ))}
+                    </div>
+                  )}
                 </div>
                 {transcribing && (
                   <span className="text-[11px] text-muted-foreground shrink-0 flex items-center gap-1">
@@ -1252,11 +1261,11 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
               </div>
               <button
                 type="button"
-                onClick={() => stopListening()}
+                onClick={() => stopListening({ send: true })}
                 disabled={transcribing}
                 className="pill-btn pill-btn-send shrink-0 disabled:opacity-50"
-                title="Stop recording"
-                aria-label="Stop recording"
+                title="Stop and send"
+                aria-label="Stop and send"
               >
                 {transcribing ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
               </button>
@@ -1293,6 +1302,7 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
                   }}
                   placeholder={uploadingStatement ? "Reading your file…" : "Tell me about a transaction…"}
                   rows={1}
+                  enterKeyHint="send"
                 />
               </div>
               {input.trim() ? (
@@ -1308,13 +1318,12 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
               ) : (
                 <button
                   type="button"
-                  onPointerDown={onMicPointerDown}
-                  onPointerUp={onMicPointerUp}
-                  onPointerLeave={onMicPointerLeave}
+                  onClick={onMicClick}
+                  disabled={sending || uploadingStatement}
                   onContextMenu={(e) => e.preventDefault()}
                   className="pill-btn pill-btn-send shrink-0 select-none touch-none"
-                  title="Hold to talk (or tap to toggle)"
-                  aria-label="Hold to talk"
+                  title="Tap to record"
+                  aria-label="Record a voice message"
                 >
                   <Mic className="w-5 h-5" />
                 </button>

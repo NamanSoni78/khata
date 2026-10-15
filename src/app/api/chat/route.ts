@@ -19,13 +19,14 @@ async function getDashboardUser() {
   return await getSessionUser(token, "dashboard");
 }
 
-// Default page size for history. Older messages are fetched page-by-page when
-// the user scrolls up (cursor pagination) — everything stays saved in the DB.
-const HISTORY_PAGE_SIZE = 100;
+// Default page size for history. The home app shows the latest 50 messages
+// (the full transcript is exportable from the dashboard). Older messages stay
+// saved in the DB forever.
+const HISTORY_PAGE_SIZE = 50;
 
-// GET /api/chat?action=history — chat history for the daily app (paginated).
-//   ?limit=N   page size (default 100 — the UI shows the latest 100 and loads
-//              older ones on scroll-up)
+// GET /api/chat?action=history — DAILY chat history (paginated, dashboard-
+// agent turns excluded — that's a separate thread).
+//   ?limit=N   page size (default 50)
 //   ?before=ISO  cursor: return messages strictly older than this timestamp
 //   Returns { messages: [...], hasMore: boolean }
 export async function GET(req: NextRequest) {
@@ -40,7 +41,12 @@ export async function GET(req: NextRequest) {
     const limit = Math.min(parseInt(url.searchParams.get("limit") ?? String(HISTORY_PAGE_SIZE), 10) || HISTORY_PAGE_SIZE, 200);
     const before = url.searchParams.get("before");
 
-    const where: any = { userId: user.id, role: { in: ["user", "assistant"] } };
+    const where: any = {
+      userId: user.id,
+      role: { in: ["user", "assistant"] },
+      // only the DAILY thread — dashboard-agent turns never appear in the home app
+      NOT: { metadata: { contains: '"source":"dashboard"' } },
+    };
     if (before) {
       const d = new Date(before);
       if (!isNaN(d.getTime())) where.createdAt = { lt: d };

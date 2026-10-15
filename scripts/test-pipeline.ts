@@ -66,10 +66,12 @@ let cookie = "";
 
 // save previous config, point daily agent at mock
 let prev: any = null;
+let prevDash: any = null;
 {
   const r = await fetch(`${BASE}/api/admin/config`, { headers: { cookie } });
   const j = await r.json();
   prev = j["agent.daily"];
+  prevDash = j["agent.dashboard"];
   check("read admin config", r.ok);
 }
 {
@@ -162,6 +164,59 @@ const track = (r: Response) => { const c = r.headers.get("set-cookie"); if (c) j
   check("history: has user + assistant msgs", (hj.messages ?? []).length >= 2);
 }
 
+// ---------- chat thread separation (daily vs dashboard analysis agent) ----------
+{
+  const d = await fetch(`${BASE}/api/dashboard/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, dashboardMpin: "111222" }),
+  });
+  const djar = (d.headers.get("set-cookie") ?? "").split(";")[0];
+
+  // dashboard agent turn (mock replies text-only)
+  {
+    const cfg = await fetch(`${BASE}/api/admin/config`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify({
+        key: "agent.dashboard",
+        value: {
+          provider: "openai-compatible",
+          baseUrl: MOCK,
+          apiKey: "mock-key",
+          model: "mock-model",
+          temperature: 0.1,
+          maxTokensMode: "max_tokens",
+          maxTokens: 500,
+          toolCallingSupported: true,
+          systemPrompt: "you are khata",
+        },
+      }),
+    });
+    check("point agent.dashboard at mock", cfg.ok);
+  }
+  const dd = await fetch(`${BASE}/api/dashboard/deep-dive`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", cookie: djar },
+    body: JSON.stringify({ message: "break down my expenses by category" }),
+  });
+  check("deep-dive reply", dd.ok, String(dd.status));
+
+  // home history must NOT contain the dashboard agent turn
+  const h = await fetch(`${BASE}/api/chat?action=history`, { headers: { cookie: jar.join("; ") } });
+  const hj = await h.json();
+  const homeText = (hj.messages ?? []).map((m: any) => m.content).join(" ");
+  check("home history excludes dashboard-agent turn", !homeText.includes("break down my expenses"));
+  check("home history keeps daily turn", homeText.includes("rapido"));
+
+  // chat-history export contains BOTH threads, sectioned
+  const ex = await fetch(`${BASE}/api/dashboard/export?type=chat`, { headers: { cookie: djar } });
+  const exText = await ex.text();
+  check("chat export 200 + txt", ex.ok && exText.includes("Khata — Chat History"));
+  check("chat export has DAILY section w/ daily msg", exText.includes("DAILY CHAT") && exText.includes("rapido"));
+  check("chat export has ANALYSIS section w/ dashboard msg", exText.includes("ANALYSIS AGENT") && exText.includes("break down my expenses"));
+}
+
 // ---------- restore admin config ----------
 {
   const r = await fetch(`${BASE}/api/admin/config`, {
@@ -170,6 +225,12 @@ const track = (r: Response) => { const c = r.headers.get("set-cookie"); if (c) j
     body: JSON.stringify({ key: "agent.daily", value: prev }),
   });
   check("restored agent.daily config", r.ok);
+  const r2 = await fetch(`${BASE}/api/admin/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", cookie },
+    body: JSON.stringify({ key: "agent.dashboard", value: prevDash }),
+  });
+  check("restored agent.dashboard config", r2.ok);
 }
 
 console.log(`\n${passed} passed · ${failed} failed`);

@@ -3,7 +3,7 @@
 // - Listens for push events (Phase 3 will activate the displayNotification)
 // - Listens for "sync" event (Phase 3 will flush queued messages via Background Sync API)
 
-const CACHE_NAME = "khata-v5";
+const CACHE_NAME = "khata-v6"; // v6: PNG notification icons (Android compatibility)
 const APP_SHELL = [
   "/",
   "/manifest.json",
@@ -85,8 +85,8 @@ self.addEventListener("push", (e) => {
   const title = data.title ?? "Khata";
   const options = {
     body: data.body ?? data.message ?? "",
-    icon: "/icon-192.svg",
-    badge: "/icon-192.svg",
+    icon: "/icon-192.png",
+    badge: "/icon-maskable-512.png",
     data: { url: data.url ?? "/" },
     vibrate: [200, 80, 200],
     requireInteraction: false,

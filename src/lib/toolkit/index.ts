@@ -55,14 +55,19 @@ export {
  */
 export function registryFromDefs(
   defs: ToolDefinition[],
-  dispatch: (name: string, userId: string, args: Record<string, unknown>) => Promise<string>
+  dispatch: (
+    name: string,
+    userId: string,
+    args: Record<string, unknown>,
+    ctx?: ToolContext
+  ) => Promise<string>
 ): ToolRegistry {
   const registry = new ToolRegistry();
   const specs: ToolSpec[] = defs.map((d) => ({
     name: d.function.name,
     description: d.function.description,
     parameters: d.function.parameters as Record<string, unknown>,
-    execute: (args, ctx: ToolContext) => dispatch(d.function.name, ctx.userId, args),
+    execute: (args, ctx: ToolContext) => dispatch(d.function.name, ctx.userId, args, ctx),
   }));
   registry.register(...specs);
   return registry;

@@ -12,6 +12,15 @@ export async function GET(req: NextRequest) {
   }
   const userId = user.id;
   const url = new URL(req.url);
+
+  // ---- Chat-history export: WhatsApp-style .txt transcript ----
+  // Downloads BOTH threads (the everyday chat + the dashboard analysis
+  // agent), clearly sectioned. This is the archive for messages older than
+  // the 50 the home app displays.
+  if (url.searchParams.get("type") === "chat") {
+    return await exportChatHistory(userId, url);
+  }
+
   const fromDate = url.searchParams.get("from");
   const toDate = url.searchParams.get("to");
   const format = (url.searchParams.get("format") ?? "csv").toLowerCase();
@@ -58,6 +67,76 @@ export async function GET(req: NextRequest) {
   return new NextResponse(csv, {
     headers: {
       "Content-Type": "text/csv; charset=utf-8",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+    },
+  });
+}
+
+/** WhatsApp-style chat transcript export — both threads, human-readable. */
+async function exportChatHistory(userId: string, url: URL): Promise<NextResponse> {
+  const from = url.searchParams.get("from");
+  const to = url.searchParams.get("to");
+
+  const where: any = { userId, role: { in: ["user", "assistant"] } };
+  if (from || to) {
+    where.createdAt = {};
+    if (from) where.createdAt.gte = new Date(from);
+    if (to) {
+      const t = new Date(to);
+      t.setHours(23, 59, 59, 999);
+      where.createdAt.lte = t;
+    }
+  }
+
+  const all = await db.chatMessage.findMany({
+    where,
+    orderBy: { createdAt: "asc" },
+  });
+
+  const isDash = (m: { metadata: string }) => m.metadata?.includes('"source":"dashboard"');
+  const daily = all.filter((m) => !isDash(m));
+  const dashboard = all.filter(isDash);
+
+  const fmtTime = (d: Date) =>
+    d.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true });
+
+  const lines: string[] = [];
+  lines.push("Khata — Chat History");
+  lines.push(`Exported ${fmtTime(new Date())} (IST)`);
+  if (from || to) lines.push(`Range: ${from ?? "(beginning)"} → ${to ?? "(now)"}`);
+  lines.push("=".repeat(60));
+
+  const section = (title: string, msgs: typeof all) => {
+    lines.push("");
+    lines.push(title);
+    lines.push("-".repeat(60));
+    if (msgs.length === 0) {
+      lines.push("(no messages)");
+      return;
+    }
+    let lastDay = "";
+    for (const m of msgs) {
+      const day = fmtTime(m.createdAt).split(",")[0];
+      if (day !== lastDay) {
+        lines.push("");
+        lines.push(`— ${day} —`);
+        lastDay = day;
+      }
+      const who = m.role === "user" ? "You" : "Khata";
+      const time = fmtTime(m.createdAt).split(", ").pop();
+      lines.push(`[${time}] ${who}:`);
+      lines.push(m.content.trim());
+      lines.push("");
+    }
+  };
+
+  section(`DAILY CHAT (${daily.length} messages) — your everyday app conversation`, daily);
+  section(`ANALYSIS AGENT (${dashboard.length} messages) — dashboard deep-dive conversation`, dashboard);
+
+  const filename = `khata_chat_history_${new Date().toISOString().slice(0, 10)}.txt`;
+  return new NextResponse(lines.join("\n"), {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
       "Content-Disposition": `attachment; filename="${filename}"`,
     },
   });

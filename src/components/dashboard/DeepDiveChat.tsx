@@ -81,14 +81,19 @@ export default function DeepDiveChat() {
 
   return (
     <div className="bg-card border border-border rounded-2xl">
-      <div className="px-5 pt-5 pb-3">
-        <h2 className="font-semibold text-sm text-foreground flex items-center gap-2">
-          <Sparkles className="w-4 h-4 text-primary" /> Ask your data
-        </h2>
-        <p className="text-xs text-muted-foreground mt-1.5">
-          Analytical questions about your money — answered with real numbers, with charts offered when useful.
-          Understands IPO, SIP, FD, demat and 50+ other terms.
-        </p>
+      <div className="px-5 pt-5 pb-3 flex items-start gap-2.5">
+        <span className="w-8 h-8 rounded-xl bg-primary/10 text-primary flex items-center justify-center shrink-0 mt-0.5">
+          <Sparkles className="w-4 h-4" />
+        </span>
+        <div>
+          <h2 className="font-semibold text-sm text-foreground">Analysis agent</h2>
+          <p className="text-xs text-muted-foreground mt-1">
+            Analytical questions about your money — real numbers, charts offered when useful. Understands IPO, SIP, FD, demat and 50+ terms.
+          </p>
+          <p className="text-[11px] text-muted-foreground/80 mt-1">
+            This conversation is separate from your everyday app chat — export both anytime from “Export chat history”.
+          </p>
+        </div>
       </div>
       <div className="px-5 pb-5 space-y-3">
         <div
@@ -116,8 +121,8 @@ export default function DeepDiveChat() {
               <div
                 className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm leading-relaxed ${
                   m.role === "user"
-                    ? "bg-primary text-primary-foreground rounded-br-md"
-                    : "bg-card border border-border text-foreground rounded-bl-md"
+                    ? "bg-[var(--primary-deep)] text-white rounded-br-md"
+                    : "bg-primary/[0.06] dark:bg-primary/[0.12] border border-primary/15 dark:border-primary/20 text-foreground rounded-bl-md"
                 }`}
               >
                 <Markdown text={m.text} />

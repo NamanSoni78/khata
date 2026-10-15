@@ -21,7 +21,13 @@ Resend (email OTP) · Web Push (VAPID) + Upstash QStash · PWA.
 ### Highlights
 - **Gmail-only accounts** (dots/+tag aliases rejected) with **OTP verification via Resend**,
   forgot-password flow, and MPIN-based returning login (4-digit app / 6-digit dashboard,
-  brute-force lockout, reset with Gmail + password).
+  brute-force lockout, reset with Gmail + password). The keypads accept **physical-keyboard
+  typing** too — blaze through the unlock without touching the screen.
+- **Separate chat threads**: the everyday app chat and the dashboard Analysis agent never mix.
+  The home app shows the latest 50 messages; the complete archive of BOTH threads downloads
+  from the dashboard ("Export chat history" → WhatsApp-style .txt transcript).
+- **Tap-to-record voice notes**: tap the mic → recording pill with live transcript preview →
+  send button stops AND sends (or trash to discard). Fixed the recording that never stopped.
 - **Turso database** via Prisma's official libSQL adapter — same code path locally (SQLite file)
   and in production (libsql://). Liquid schema: every entity carries a `metadata` JSON column.
 - **User-owned AI**: per-user overrides (URL/key/model) on top of admin defaults — field-by-field
@@ -30,9 +36,10 @@ Resend (email OTP) · Web Push (VAPID) + Upstash QStash · PWA.
   or any OpenAI-compatible `/audio/transcriptions` endpoint (recorded audio proxied server-side
   so keys never hit the browser). Wrong URL pastes (e.g. `/chat/completions`) are auto-corrected.
 - **QStash multi-account pool** — put several accounts in the env vars (`;`-separated) and
-  reminder schedules spread across them automatically.
-- PWA: offline message queue, install prompt, doodle wallpapers, Web Push notifications,
-  daily/weekly/monthly reminders with IST-exact delivery.
+  reminder schedules spread across them automatically. Push delivery is verified end-to-end
+  (VAPID-signed, RFC 8291-encrypted payloads) by `scripts/test-notifications.ts`.
+- PWA: offline message queue, install prompt, doodle wallpapers, Web Push notifications
+  (PNG icons — Android-safe), daily/weekly/monthly reminders with IST-exact delivery.
 
 ---
 

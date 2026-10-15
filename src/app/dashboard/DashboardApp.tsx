@@ -8,7 +8,7 @@ import {
 import {
   TrendingUp, Download, LogOut, ArrowLeft, Users,
   RefreshCw, Bell, Plus, Trash2, FileText, Moon, Sun, Settings as SettingsIcon,
-  Loader2, Upload, Copy, CalendarDays,
+  Loader2, Upload, Copy, CalendarDays, MessageSquareText,
 } from "lucide-react";
 import { MultiPeriodChart } from "@/components/dashboard/MultiPeriodChart";
 import DeepDiveChat from "@/components/dashboard/DeepDiveChat";
@@ -47,6 +47,8 @@ export default function DashboardApp({ username }: { username: string }) {
   const [period, setPeriod] = useState<Period>("month");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
+  const [chatFromDate, setChatFromDate] = useState("");
+  const [chatToDate, setChatToDate] = useState("");
   const [exportingPdf, setExportingPdf] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [copyingPrompt, setCopyingPrompt] = useState(false);
@@ -491,6 +493,55 @@ export default function DashboardApp({ username }: { username: string }) {
           </div>
           <p className="px-5 pb-5 text-xs text-muted-foreground">
             Leave dates empty to export everything. You can also ask the assistant to export a range for you.
+          </p>
+        </div>
+
+        {/* Export chat history (both threads — everyday chat + this analysis agent) */}
+        <div className="bg-card border border-border rounded-2xl anim-fade-up">
+          <div className="px-5 pt-5 pb-3 flex items-center gap-2.5">
+            <span className="w-8 h-8 rounded-xl bg-primary/10 text-primary flex items-center justify-center shrink-0">
+              <MessageSquareText className="w-4 h-4" />
+            </span>
+            <div>
+              <h2 className="font-semibold text-sm text-foreground">Export chat history</h2>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Downloads your complete archive — the everyday app shows only the last 50 messages.
+              </p>
+            </div>
+          </div>
+          <div className="px-5 pb-5 flex flex-wrap items-end gap-2">
+            <div>
+              <label className="text-xs text-muted-foreground block mb-1">From date</label>
+              <input
+                type="date"
+                value={chatFromDate}
+                onChange={(e) => setChatFromDate(e.target.value)}
+                className="h-10 rounded-xl border border-input bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground block mb-1">To date</label>
+              <input
+                type="date"
+                value={chatToDate}
+                onChange={(e) => setChatToDate(e.target.value)}
+                className="h-10 rounded-xl border border-input bg-background px-3 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+              />
+            </div>
+            <button
+              onClick={() => {
+                const params = new URLSearchParams({ type: "chat" });
+                if (chatFromDate) params.set("from", chatFromDate);
+                if (chatToDate) params.set("to", chatToDate);
+                window.open(`/api/dashboard/export?${params.toString()}`, "_blank");
+              }}
+              className="press h-10 px-4 rounded-xl bg-primary text-primary-foreground text-sm font-medium flex items-center gap-2 hover:opacity-95 transition-opacity"
+            >
+              <Download className="w-4 h-4" /> Chat transcript (.txt)
+            </button>
+          </div>
+          <p className="px-5 pb-5 text-xs text-muted-foreground">
+            Both conversations are included, clearly sectioned: your everyday chat and this analysis agent's chat.
           </p>
         </div>
 

@@ -862,12 +862,22 @@ export async function retrieveTransactions(userId: string, args: Args): Promise<
  * question refers to an old conversation ("what did I tell you about the
  * ICICI account last month?"), making context effectively infinite.
  */
-export async function searchChatHistory(userId: string, args: Args): Promise<string> {
+export async function searchChatHistory(
+  userId: string,
+  args: Args,
+  agentType?: string
+): Promise<string> {
   const query = String(args.query ?? "").toLowerCase().trim();
   if (!query) return "Error: query is required";
   const limit = Math.min(Number(args.limit ?? 15), 50);
 
   const where: any = { userId, role: { in: ["user", "assistant"] } };
+  // Each agent searches ITS OWN thread (daily vs dashboard analysis).
+  if (agentType === "dashboard") {
+    where.metadata = { contains: '"source":"dashboard"' };
+  } else if (agentType === "daily") {
+    where.NOT = { metadata: { contains: '"source":"dashboard"' } };
+  }
   if (args.from_date || args.to_date) {
     where.createdAt = {};
     if (args.from_date) where.createdAt.gte = new Date(args.from_date as string);
@@ -924,7 +934,8 @@ export async function searchChatHistory(userId: string, args: Args): Promise<str
 export async function dispatchTool(
   toolName: string,
   userId: string,
-  args: Args
+  args: Args,
+  ctx?: { agentType?: string; [k: string]: unknown }
 ): Promise<string> {
   switch (toolName) {
     case "log_expense": return logExpense(userId, args);
@@ -937,7 +948,7 @@ export async function dispatchTool(
     case "aggregate": return aggregate(userId, args);
     case "get_account_summary": return getAccountSummary(userId, {});
     case "retrieve_transactions": return retrieveTransactions(userId, args);
-    case "search_chat_history": return searchChatHistory(userId, args);
+    case "search_chat_history": return searchChatHistory(userId, args, ctx?.agentType);
     case "create_scheduled_notification": return createScheduledNotification(userId, args);
     case "export_data": return exportData(userId, args);
     case "link_transactions": return linkTransactions(userId, args);

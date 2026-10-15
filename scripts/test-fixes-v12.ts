@@ -167,10 +167,11 @@ console.log("\n--- QStash destination (mocked API) ---");
       { id: "r_v12", type: "daily", time: "20:00" },
       "https://khata.namansoni.in" // what originFromRequest() would pass
     );
+    // V1.5 wire format: the destination rides RAW in the request path.
     eq(
       "request-derived destination used despite garbage env",
-      captured[0]?.body?.destination,
-      "https://khata.namansoni.in/api/notifications/cron?rid=r_v12"
+      captured[0]?.url,
+      "https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=r_v12"
     );
     check("schedule created with request-derived destination", !!created?.scheduleId);
 
@@ -199,9 +200,9 @@ console.log("\n--- QStash destination (mocked API) ---");
     captured.length = 0;
     await createQStashScheduleForReminder({ id: "r_v12c", type: "daily", time: "20:00" });
     eq(
-      "scheme-less env normalized to https destination",
-      captured[0]?.body?.destination,
-      "https://khata.namansoni.in/api/notifications/cron?rid=r_v12c"
+      "scheme-less env normalized to https destination (raw in path)",
+      captured[0]?.url,
+      "https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=r_v12c"
     );
 
     // 4d. APP_URL runtime fallback used when no baseUrl passed.
@@ -210,10 +211,24 @@ console.log("\n--- QStash destination (mocked API) ---");
     captured.length = 0;
     await createQStashScheduleForReminder({ id: "r_v12d", type: "daily", time: "09:10" });
     eq(
-      "APP_URL runtime fallback wins over quoted NEXT_PUBLIC",
-      captured[0]?.body?.destination,
-      "https://runtime-fallback.example.com/api/notifications/cron?rid=r_v12d"
+      "APP_URL runtime fallback wins over quoted NEXT_PUBLIC (raw in path)",
+      captured[0]?.url,
+      "https://qstash.upstash.io/v2/schedules/https://runtime-fallback.example.com/api/notifications/cron?rid=r_v12d"
     );
+
+    // 4e. V1.5 whitespace guard: a baseUrl with stray internal whitespace
+    //     can never leak into the QStash destination.
+    captured.length = 0;
+    await createQStashScheduleForReminder(
+      { id: "r_v12e", type: "daily", time: "20:00" },
+      " https://khata.namansoni.in " // padded with spaces
+    );
+    eq(
+      "whitespace-padded baseUrl trimmed (no spaces in destination)",
+      captured[0]?.url,
+      "https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=r_v12e"
+    );
+    check("destination contains no whitespace", !/\s/.test(String(captured[0]?.url ?? "")));
   } finally {
     (globalThis as any).fetch = origFetch;
     process.env = saved;

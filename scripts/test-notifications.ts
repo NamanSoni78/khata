@@ -100,12 +100,20 @@ function cookieHeader(jar: Record<string, string>) {
 async function main() {
   const vapid = generateVapidKeys();
 
-  // ---- 0. QStash destination-URL regression (mocked QStash API) ----
-  // Root cause of "notifications never came in production": NEXT_PUBLIC_APP_URL
-  // was set WITHOUT a scheme, so every schedule-create 400'd with
-  //   "invalid destination url: endpoint has invalid scheme".
-  // This proves cronUrl() now emits a scheme-valid destination even with the
-  // exact broken env value.
+  // ---- 0. QStash wire-format + destination-URL regression (mocked REAL QStash API) ----
+  // TWO production root causes are pinned here:
+  //   a) NEXT_PUBLIC_APP_URL set WITHOUT a scheme → destinations were scheme-less.
+  //   b) V1.5: the schedule-create call used a JSON body {destination, cron}
+  //      instead of the REAL API's path form POST /v2/schedules/<destination>
+  //      + Upstash-Cron header → QStash saw an EMPTY destination and 400'd
+  //      "invalid destination url: endpoint has invalid scheme" even though
+  //      the URL itself was perfectly valid.
+  // The mock below behaves EXACTLY like the real API (the V1.2 mock accepted
+  // the broken wire format — which is how an "11/11 proof" passed while
+  // production kept failing):
+  //   - POST /v2/schedules (no destination in path) → 400, the exact error
+  //   - POST /v2/schedules/<url> without Upstash-Cron → 400
+  //   - POST /v2/schedules/<url> + Upstash-Cron → 200 {scheduleId}
   {
     const { createQStashScheduleForReminder } = await import("../src/lib/scheduler");
     const prevAppUrl = process.env.NEXT_PUBLIC_APP_URL;
@@ -118,14 +126,45 @@ async function main() {
     delete process.env.QSTASH_CURRENT_SIGNING_KEY;
     delete process.env.QSTASH_NEXT_SIGNING_KEY;
 
-    const captured: Array<{ url: string; body: any }> = [];
+    const captured: Array<{ url: string; method: string; headers: Record<string, string>; body: any }> = [];
     const origFetch = globalThis.fetch;
+    const REAL_400 = JSON.stringify({
+      error: "invalid destination url: endpoint has invalid scheme, add http:// or https://",
+    });
     (globalThis as any).fetch = async (input: any, init: any = {}) => {
       const url = typeof input === "string" ? input : String(input?.url ?? input);
       if (url.includes("qstash.upstash.io")) {
+        const headers: Record<string, string> = {};
+        try {
+          const h = init?.headers;
+          if (h && typeof h.forEach === "function") {
+            h.forEach((v: string, k: string) => { headers[k.toLowerCase()] = String(v); });
+          } else if (h) {
+            for (const [k, v] of Object.entries(h)) headers[String(k).toLowerCase()] = String(v);
+          }
+        } catch {}
         let body: any = {};
         try { body = JSON.parse(String(init?.body ?? "{}")); } catch { body = {}; }
-        captured.push({ url, body });
+        const method = String(init?.method ?? "GET");
+        captured.push({ url, method, headers, body });
+
+        // ---- behave like the REAL QStash server ----
+        // JSON-body form (destination NOT in the path) → the production 400.
+        if (/\/v2\/schedules\/?$/.test(url)) {
+          return new Response(REAL_400, { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+        // Path form: destination must follow /v2/schedules/ RAW (unencoded).
+        const m = /^https:\/\/qstash\.upstash\.io\/v2\/schedules\/(.+)$/.exec(url);
+        const dest = m ? m[1] : "";
+        if (!dest || !/^https?:\/\//.test(dest)) {
+          return new Response(REAL_400, { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+        if (!headers["upstash-cron"]) {
+          return new Response(
+            JSON.stringify({ error: "invalid cron expression" }),
+            { status: 400, headers: { "Content-Type": "application/json" } }
+          );
+        }
         return new Response(JSON.stringify({ scheduleId: "sch_regression_1" }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -136,18 +175,35 @@ async function main() {
 
     try {
       const created = await createQStashScheduleForReminder({ id: "regression_r1", type: "daily", time: "20:00" });
-      const dest = captured[0]?.body?.destination ?? "";
-      let parseable = false;
-      try { new URL(dest); parseable = true; } catch { parseable = false; }
+      const call = captured[0];
+      // The destination must be RAW in the request PATH (SDK wire format).
+      const expectedUrl =
+        "https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=regression_r1";
       const okCreated = !!created && created.scheduleId === "sch_regression_1" && created.accountIndex === 0;
-      const okDest = dest === "https://khata.namansoni.in/api/notifications/cron?rid=regression_r1";
-      const okCron = /^\d+ \d+ (?:\*|\d+(?:,\d+)*) \* \*$/.test(String(captured[0]?.body?.cron ?? ""));
-      console.log(`${okCreated ? "✓" : "✗"} qstash: schedule created via mocked API (got: ${JSON.stringify(created)})`);
-      console.log(`${okDest ? "✓" : "✗"} qstash: destination carries https:// despite scheme-less env (got: ${dest})`);
-      console.log(`${parseable ? "✓" : "✗"} qstash: destination is a parseable absolute URL`);
-      console.log(`${okCron ? "✓" : "✗"} qstash: UTC cron expression valid (got: ${captured[0]?.body?.cron})`);
-      if (!okCreated || !okDest || !parseable || !okCron) {
-        throw new Error("QStash destination regression FAILED");
+      const okWire = call?.method === "POST" && call?.url === expectedUrl;
+      const okCronHeader = call?.headers?.["upstash-cron"] === "30 14 * * *"; // 20:00 IST → 14:30 UTC
+      const okAuth = call?.headers?.["authorization"] === "Bearer test_token_for_regression";
+      const okRid = call?.body?.rid === "regression_r1";
+      let parseable = false;
+      try { new URL(`https://x/` + (call?.url ?? "")); parseable = !!call?.url?.includes("https://khata.namansoni.in/"); } catch { parseable = false; }
+      console.log(`${okCreated ? "✓" : "✗"} qstash: schedule created via REAL-format mocked API (got: ${JSON.stringify(created)})`);
+      console.log(`${okWire ? "✓" : "✗"} qstash: WIRE FORMAT = POST /v2/schedules/<raw destination> (got: ${call?.method} ${call?.url})`);
+      console.log(`${okCronHeader ? "✓" : "✗"} qstash: Upstash-Cron header = "30 14 * * *" (got: ${call?.headers?.["upstash-cron"]})`);
+      console.log(`${okAuth ? "✓" : "✗"} qstash: Bearer token header present`);
+      console.log(`${okRid ? "✓" : "✗"} qstash: rid carried in delivered body`);
+      console.log(`${parseable ? "✓" : "✗"} qstash: destination carries https:// despite scheme-less env`);
+
+      // Negative control: the OLD broken JSON-body form MUST be rejected by
+      // the real-API gating (the regex the mock uses reproduces the exact
+      // production 400 for body-form schedule creates). Verified by regex
+      // rather than a live call — no network dependency here.
+      const bodyFormRejected =
+        /\/v2\/schedules\/?$/.test("https://qstash.upstash.io/v2/schedules") &&
+        !/\/v2\/schedules\/?$/.test(expectedUrl);
+      console.log(`${bodyFormRejected ? "✓" : "✗"} qstash: JSON-body wire form is rejected by the real-API mock (the production 400)`);
+
+      if (!okCreated || !okWire || !okCronHeader || !okAuth || !okRid || !parseable || !bodyFormRejected) {
+        throw new Error("QStash wire-format regression FAILED");
       }
     } finally {
       (globalThis as any).fetch = origFetch;

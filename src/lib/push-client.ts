@@ -352,6 +352,8 @@ export interface TestPushResult {
   /** First failure reason (from the push service), when any. */
   error?: string;
   httpError?: string;
+  /** Devices (browser + OS) the test targeted — V1.5. */
+  devices?: { id: string; label: string; endpointTail: string; subscribedAt: string | null }[];
 }
 
 /** POST /api/notifications/test and report the TRUTH. */
@@ -371,16 +373,30 @@ export async function sendTestPush(message?: string): Promise<TestPushResult> {
       sent: Number(j.sent ?? 0),
       failed: Number(j.failed ?? 0),
       error: typeof j.error === "string" ? j.error : undefined,
+      devices: Array.isArray(j.devices) ? j.devices : [],
     };
   } catch (e: any) {
     return { ok: false, sent: 0, failed: 0, httpError: e?.message ?? "network error" };
   }
 }
 
+function ageOf(iso: string | null): string {
+  if (!iso) return "";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (Number.isNaN(ms) || ms < 0) return "";
+  const mins = Math.floor(ms / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
+}
+
 /**
- * Turn a TestPushResult into honest user-facing text. The old UI said
- * "Sent! Check your notifications" even when sent === 0 — which is how
- * "test notification not working" went undiagnosed for so long.
+ * Turn a TestPushResult into honest user-facing text. V1.5: says WHICH
+ * device(s) were targeted (browser + OS + how old the subscription is) and,
+ * when a push was accepted but nothing showed, names the two usual OS-level
+ * suspects (Focus Assist / notification-center mute) instead of shrugging.
  */
 export function describeTestResult(r: TestPushResult): { kind: "ok" | "warn" | "error"; text: string } {
   if (!r.ok) {
@@ -389,13 +405,22 @@ export function describeTestResult(r: TestPushResult): { kind: "ok" | "warn" | "
       text: r.httpError ?? "Couldn't send the test notification.",
     };
   }
+  const deviceText = (r.devices ?? [])
+    .map((d) => `${d.label}${ageOf(d.subscribedAt) ? ` · subscribed ${ageOf(d.subscribedAt)}` : ""}`)
+    .join(", ");
   if (r.sent > 0 && r.failed === 0) {
-    return { kind: "ok", text: `Sent to ${r.sent} device${r.sent === 1 ? "" : "s"} — check your notifications.` };
+    return {
+      kind: "ok",
+      text:
+        `Sent to ${r.sent} device${r.sent === 1 ? "" : "s"}${deviceText ? ` (${deviceText})` : ""} — ` +
+        `it stays on screen until dismissed. If nothing appears: check the notification center / ` +
+        `Focus Assist (Windows) or Do Not Disturb, and that the target browser is running.`,
+    };
   }
   if (r.sent > 0 && r.failed > 0) {
     return {
       kind: "warn",
-      text: `Sent to ${r.sent} device${r.sent === 1 ? "" : "s"}, but ${r.failed} subscription${r.failed === 1 ? "" : "s"} failed${r.failed === 1 ? "" : "s"}${r.error ? ` (${r.error})` : ""}.`,
+      text: `Sent to ${r.sent} device${r.sent === 1 ? "" : "s"}${deviceText ? ` (${deviceText})` : ""}, but ${r.failed} subscription${r.failed === 1 ? "" : "s"} failed${r.failed === 1 ? "" : "s"}${r.error ? ` (${r.error})` : ""}.`,
     };
   }
   return {

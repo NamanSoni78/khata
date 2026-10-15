@@ -4,6 +4,7 @@ import { getSessionToken } from "@/lib/auth/cookies";
 import { db } from "@/lib/db";
 import { createReminder, deleteReminder, pauseReminder, describeReminder, repairMissingQStashSchedules } from "@/lib/scheduler";
 import { originFromRequest } from "@/lib/app-url";
+import { listDevices } from "@/lib/notifications/push";
 
 // GET: list user's reminders (human-readable descriptions — never cron syntax)
 export async function GET(req: NextRequest) {
@@ -23,6 +24,9 @@ export async function GET(req: NextRequest) {
     where: { userId: user.id },
     orderBy: { createdAt: "desc" },
   });
+  // V1.5: the user's subscribed devices (browser + OS + when) — surfaces
+  // stale ghost subscriptions that silently swallow pushes.
+  const devices = await listDevices(user.id).catch(() => []);
   return NextResponse.json({
     notifications: notifs.map((n) => ({
       id: n.id,
@@ -39,6 +43,7 @@ export async function GET(req: NextRequest) {
       lastFiredAt: n.lastFiredAt?.toISOString() ?? null,
       createdAt: n.createdAt.toISOString(),
     })),
+    devices,
   });
 }
 

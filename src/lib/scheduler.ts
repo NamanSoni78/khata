@@ -220,6 +220,17 @@ export function istReminderToUTCCron(rem: ReminderShape): string | null {
 //  QStash REST client (no SDK dependency — plain fetch)
 //  Multi-account: schedules spread across pooled accounts (qstash-pool.ts),
 //  one-time publishes rotate round-robin.
+//
+//  *** V1.5 WIRE FORMAT ***
+//  POST /v2/schedules with a JSON body { destination, cron } looks right but
+//  is silently WRONG — the real QStash API (verified against the official
+//  @upstash/qstash SDK's Schedules.create(), which sends
+//  `path: ["v2", "schedules", request.destination]`) takes the destination
+//  URL RAW IN THE REQUEST PATH and the cron in the `Upstash-Cron` HEADER.
+//  Sending the JSON-body form makes QStash see an EMPTY destination →
+//  400 "invalid destination url: endpoint has invalid scheme" — the exact
+//  production error that survived V1.1 and V1.2 because both fixes addressed
+//  the URL *content* while the *transport format* was the bug.
 // ============================================================
 
 const QSTASH_BASE = "https://qstash.upstash.io/v2";
@@ -236,16 +247,24 @@ export function isQStashConfigured(): boolean {
  * host the client demonstrably just reached us on; env values can be stale
  * (NEXT_PUBLIC_* vars are BUILD-TIME inlined on Vercel) or mangled (quotes).
  * Falls back to the hardened env chain when absent.
- * The result is ALWAYS validated: scheme http(s) + parsable, or we return
- * null and the caller skips QStash instead of sending garbage.
+ * The result is ALWAYS validated: scheme http(s) + parsable + ZERO whitespace
+ * (a stray space anywhere in the final URL — the user's suspicion — is either
+ * stripped or rejects the URL), or we return null and the caller skips QStash
+ * instead of sending garbage.
  */
 function cronUrl(reminderId: string, baseUrl?: string): string | null {
   const base =
     (baseUrl ? normalizeAppUrl(baseUrl) : null) ?? appBaseUrl();
-  const url = `${base}/api/notifications/cron?rid=${encodeURIComponent(reminderId)}`;
+  // Whitespace guard: a pasted env var or forwarded host with stray spaces
+  // must never reach QStash. normalizeAppUrl already trims/rejects most cases;
+  // this is the belt-and-suspenders sweep over the FINAL assembled URL.
+  const url =
+    `${base}/api/notifications/cron?rid=${encodeURIComponent(reminderId)}`
+      .replace(/[\s\u0000-\u001f\u007f]/g, "");
   try {
     const u = new URL(url);
     if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (/\s/.test(u.href)) return null;
     // A loopback destination is useless to QStash (its servers can't reach
     // the user's machine) — dev/local relies on the in-process scheduler,
     // so skip schedule registration instead of registering dead weight.
@@ -297,16 +316,26 @@ export async function createQStashScheduleForReminder(
   }
 
   try {
-    const res = await fetch(`${QSTASH_BASE}/schedules`, {
+    // V1.5 CORRECT WIRE FORMAT (mirrors the official SDK):
+    //   POST https://qstash.upstash.io/v2/schedules/<destination-url>
+    //   Upstash-Cron: <cron>          (the schedule expression)
+    //   Upstash-Method: POST           (deliver with POST — our route is POST-only)
+    //   Upstash-Forward-X-Reminder-Id: <rid>  (arrives at our endpoint as a
+    //                                        header — a 2nd rid channel)
+    //   body: { "rid": <rid> }         (3rd rid channel — the delivered body)
+    // The destination goes RAW in the path (the ?rid= query rides along in
+    // the request target exactly as the SDK sends it). Do NOT JSON-body the
+    // destination — QStash ignores it and 400s with "invalid scheme".
+    const res = await fetch(`${QSTASH_BASE}/schedules/${destination}`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${account.token}`,
         "Content-Type": "application/json",
+        "Upstash-Cron": cron,
+        "Upstash-Method": "POST",
+        "Upstash-Forward-X-Reminder-Id": reminder.id,
       },
-      body: JSON.stringify({
-        destination,
-        cron,
-      }),
+      body: JSON.stringify({ rid: reminder.id }),
     });
     if (!res.ok) {
       // Log the DESTINATION too — the 400 body alone never told us WHICH
@@ -321,6 +350,10 @@ export async function createQStashScheduleForReminder(
     }
     const json = await res.json();
     if (!json.scheduleId) return null;
+    console.log(
+      `[qstash] schedule created (acct ${account.index}): ${json.scheduleId} ` +
+        `→ ${destination} (cron "${cron}")`
+    );
     return { scheduleId: json.scheduleId, accountIndex: account.index };
   } catch (e) {
     console.error("[qstash] schedule create error:", e, `— destination was: ${destination}`);
@@ -374,13 +407,17 @@ export async function publishOneTimeQStash(
     return false;
   }
   try {
-    const res = await fetch(`${QSTASH_BASE}/publish/${encodeURIComponent(destination)}`, {
+    // V1.5: destination goes RAW in the path (SDK format) — the previous
+    // encodeURIComponent form is NOT what the API documents and may or may
+    // not be decoded server-side; raw is the canonical, SDK-proven form.
+    const res = await fetch(`${QSTASH_BASE}/publish/${destination}`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${account.token}`,
         "Content-Type": "application/json",
         // Upstash delay header (seconds)
         "Upstash-Delay": `${delaySec}s`,
+        "Upstash-Forward-X-Reminder-Id": reminder.id,
       },
       body: JSON.stringify({ rid: reminder.id }),
     });
@@ -390,6 +427,11 @@ export async function publishOneTimeQStash(
         res.status,
         await res.text(),
         `— destination was: ${destination}`
+      );
+    } else {
+      console.log(
+        `[qstash] one-time publish queued (acct ${account.index}): ${destination} ` +
+          `in ${Math.round(delaySec / 60)} min`
       );
     }
     return res.ok;

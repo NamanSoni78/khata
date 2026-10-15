@@ -9,6 +9,7 @@ import {
   TrendingUp, Download, LogOut, ArrowLeft, Users,
   RefreshCw, Bell, Plus, Trash2, FileText, Moon, Sun, Settings as SettingsIcon,
   Loader2, Upload, Copy, CalendarDays, MessageSquareText, CheckCheck,
+  MonitorSmartphone,
 } from "lucide-react";
 import { MultiPeriodChart } from "@/components/dashboard/MultiPeriodChart";
 import DeepDiveChat from "@/components/dashboard/DeepDiveChat";
@@ -698,6 +699,11 @@ function NotificationsCard() {
     lastFiredAt: string | null;
   }
   const [notifs, setNotifs] = useState<Notif[]>([]);
+  // V1.5: every subscribed device across browsers (label + when) — surfaces
+  // ghost subscriptions that silently swallow pushes.
+  const [devices, setDevices] = useState<
+    { id: string; label: string; endpointTail: string; subscribedAt: string | null }[]
+  >([]);
   const [repeat, setRepeat] = useState<"once" | "daily" | "weekly" | "monthly">("daily");
   const [time, setTime] = useState("20:00");
   const [date, setDate] = useState("");
@@ -756,6 +762,7 @@ function NotificationsCard() {
     if (res.ok) {
       const j = await res.json();
       setNotifs(j.notifications ?? []);
+      setDevices(Array.isArray(j.devices) ? j.devices : []);
     }
   };
   useEffect(() => {
@@ -765,6 +772,7 @@ function NotificationsCard() {
       if (active && res.ok) {
         const j = await res.json();
         setNotifs(j.notifications ?? []);
+        setDevices(Array.isArray(j.devices) ? j.devices : []);
       }
     })();
     return () => { active = false; };
@@ -878,6 +886,27 @@ function NotificationsCard() {
             Send test
           </button>
         </div>
+
+        {/* V1.5: where notifications actually go — every subscribed device,
+            labeled by browser + OS. A stale "ghost" subscription (old browser
+            profile, uninstalled PWA) is the usual reason a test says "Sent to
+            1 device" while nothing appears anywhere you're looking. */}
+        {devices.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5 px-3 py-2 bg-muted/30 border border-border rounded-xl">
+            <MonitorSmartphone className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+            {devices.map((d) => (
+              <span
+                key={d.id}
+                className="text-[11px] px-2 py-0.5 rounded-full bg-background border border-border text-muted-foreground"
+              >
+                {d.label}
+                {d.subscribedAt
+                  ? ` · ${new Date(d.subscribedAt).toLocaleDateString("en-IN", { day: "numeric", month: "short" })}`
+                  : ""}
+              </span>
+            ))}
+          </div>
+        )}
 
         <div className="space-y-3 p-4 bg-muted/50 border border-border rounded-xl">
           {/* Repeat type */}

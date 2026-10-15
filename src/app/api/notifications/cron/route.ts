@@ -22,6 +22,12 @@ startInProcessScheduler();
  *     active reminder whose nextRunAt is due. Catches missed exact fires,
  *     legacy rows, and deployments without QSTASH_TOKEN.
  *
+ * V1.5: the reminder id arrives over THREE redundant channels — the ?rid=
+ * query in the destination URL, the X-Reminder-Id header (from QStash's
+ * Upstash-Forward-X-Reminder-Id), and the JSON body {rid} that the schedule
+ * delivers. Any one of them is enough; if QStash's router ever mangles the
+ * query string, delivery still targets the right reminder.
+ *
  * AUTH — request must pass ONE of:
  *  - Upstash server signature (JWT HS256 with QSTASH_CURRENT_SIGNING_KEY or
  *    QSTASH_NEXT_SIGNING_KEY) in the `Upstash-Signature` header
@@ -42,7 +48,22 @@ export async function POST(req: NextRequest) {
   }
 
   const url = new URL(req.url);
-  const rid = url.searchParams.get("rid");
+
+  // Reminder id — query ?rid=, then X-Reminder-Id header (QStash-forwarded),
+  // then JSON body {rid} (the schedule's delivered message). All ids are
+  // cuids (alphanumeric + -_), so the charset check blocks header/body
+  // injection of anything unexpected.
+  let rid = url.searchParams.get("rid");
+  if (!rid) {
+    const hdr = req.headers.get("x-reminder-id");
+    if (hdr && /^[A-Za-z0-9_-]{1,64}$/.test(hdr)) rid = hdr;
+  }
+  if (!rid) {
+    const body = await req.json().catch(() => null);
+    const b = typeof body?.rid === "string" ? body.rid : null;
+    if (b && /^[A-Za-z0-9_-]{1,64}$/.test(b)) rid = b;
+  }
+
   const now = new Date();
 
   // ---- Mode 1: exact-time fire for a specific reminder ----

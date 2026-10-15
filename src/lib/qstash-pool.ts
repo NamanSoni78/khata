@@ -32,6 +32,12 @@ function splitList(env: string | undefined): string[] {
   return (env ?? "")
     .split(/[;,]/)
     .map((s) => s.trim())
+    .filter(Boolean)
+    // V1.5: paste accidents put stray whitespace/control chars INSIDE tokens
+    // ("ey ABC…" from a wrapped paste). QStash tokens and signing keys never
+    // legitimately contain whitespace, so stripping it is always safe — and a
+    // whitespace-broken token otherwise 401s every call with no obvious cause.
+    .map((s) => s.replace(/[\s\u0000-\u001f\u007f]/g, ""))
     .filter(Boolean);
 }
 

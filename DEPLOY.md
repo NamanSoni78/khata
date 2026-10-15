@@ -95,22 +95,44 @@ Also keep the Resend DKIM/SPF records in place.
 | Reminders don't fire | check `QSTASH_TOKEN` + the catch-all cron (step 6.5); V1.2+ also self-heals broken schedules on the next dashboard visit / cron tick |
 | "The assistant isn't set up yet" | configure the daily agent in `/admin` |
 
-### Notifications checklist (V1.2)
+### Notifications checklist (V1.5)
 
 1. **Server log shows `[qstash] schedule create failed … invalid destination url`**
-   → shouldn't happen anymore: destinations are built from the live request
-   headers. If you ever see it, the log now prints the exact destination +
-   all env values — set `APP_URL=https://<your-domain>` and **redeploy**
-   (reminder: `NEXT_PUBLIC_*` edits require a redeploy to take effect at all).
-2. **"Enable notifications" / "Send test" did nothing**
+   → FIXED FOR REAL in V1.5. The two earlier fixes addressed the URL *content*;
+   the actual bug was the **wire format**: schedule creation POSTed a JSON body
+   `{destination, cron}` to `/v2/schedules`, but the real QStash API takes the
+   destination URL **raw in the request path** (`POST /v2/schedules/<full-url>`)
+   with the cron in the `Upstash-Cron` header (verified against the official
+   `@upstash/qstash` SDK's `Schedules.create()`). V1.5 sends the correct form,
+   and a successful create now logs
+   `[qstash] schedule created (acct 0): schd… → https://khata.namansoni.in/api/notifications/cron?rid=… (cron "30 14 * * *")`
+   so you can SEE it working in Vercel logs.
+2. **"Sent to 1 device" but no notification appeared**
+   → two causes fixed in V1.5:
+   - Every notification shared the tag `khata-notif` with `renotify:false`, so
+     consecutive notifications **silently replaced** each other (notably on
+     Android). Tests now use a unique tag + `renotify:true` and stay on screen
+     until dismissed; reminders always alert fresh.
+   - The response now tells you **WHICH device** was targeted ("Chrome on
+     Windows · subscribed 2d ago") — a stale ghost subscription on a browser
+     you're not looking at is the other classic cause. The dashboard's
+     Reminders tab lists every subscribed device.
+   - If a test is "sent" but still invisible: check the OS notification center,
+     Windows **Focus Assist / Do Not Disturb**, and that the target browser is
+     actually running (push is only delivered while the browser runs).
+3. **"Enable notifications" / "Send test" did nothing**
    → fixed in V1.2 (the service worker was never registered before). After
    redeploying, reload the app once, then Settings → Enable notifications →
    Send test. The test now reports the TRUTH ("No device is subscribed…")
    instead of a fake "Sent!".
-3. **Permission prompt** fires automatically the moment you set any
+4. **Permission prompt** fires automatically the moment you set any
    notification (dashboard Schedule/Resume buttons, or "remind me at 8pm"
    in chat). If the browser already blocked notifications, unblock via the
    lock icon → Notifications → Allow, then reload.
-4. **Subscriptions are per-device**: enable on every device you want
+5. **Subscriptions are per-device**: enable on every device you want
    notifications on. The dashboard's reminders tab shows each device's
    status and has its own Send-test button.
+6. **QStash env hygiene (V1.5)**: tokens pasted with stray whitespace or
+   wrapped across lines are auto-cleaned; the destination URL is swept for
+   whitespace before ever reaching QStash. Multiple accounts stay separated
+   by `;` in `QSTASH_TOKEN`.

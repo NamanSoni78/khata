@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
-import { getFeatureFlags, getOcrConfig, getDailyAgentConfig } from "@/lib/admin-config";
+import { getFeatureFlags } from "@/lib/admin-config";
+import { resolveOcrAgentConfig, resolveDailyAgentConfig } from "@/lib/user-config";
 import { db } from "@/lib/db";
 import { chatComplete, chatCompleteVision, type LLMMessage } from "@/lib/llm/client";
 import { DAILY_TOOLS } from "@/lib/agent/tools-defs";
@@ -32,7 +33,7 @@ export async function POST(req: NextRequest) {
   const userId = user.id;
 
   const flags = await getFeatureFlags();
-  const ocrConfig = await getOcrConfig();
+  const ocrConfig = await resolveOcrAgentConfig(userId);
 
   const formData = await req.formData();
   const file = formData.get("file");
@@ -149,7 +150,7 @@ Return ONLY the JSON: { "transactions": [...] } — no markdown, no commentary.`
   }
 
   // Step 1: ask LLM to extract structured transactions (if OCR didn't already)
-  const config = await getDailyAgentConfig();
+  const config = await resolveDailyAgentConfig(userId);
   if (!config.apiKey) {
     return NextResponse.json({
       error: "The assistant isn't set up yet. Please contact your administrator.",

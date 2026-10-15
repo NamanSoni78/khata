@@ -1,24 +1,21 @@
 import { NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
-import { getFeatureFlags } from "@/lib/admin-config";
+import { getFeatureFlags, getEffectiveSttEngine } from "@/lib/user-config";
 import { db } from "@/lib/db";
 
-// Returns the current authenticated user + flags
+// Returns the current authenticated user + flags + effective AI settings info.
 export async function GET() {
   const token = await getSessionToken("daily");
   const user = await getSessionUser(token, "daily");
   if (!user || user.id === "admin") {
     return NextResponse.json({ authenticated: false });
   }
-  const [mpin, webauthnCreds, flags] = await Promise.all([
+  const [mpin, flags, sttEngine, hasUserAi] = await Promise.all([
     db.userMpin.findUnique({ where: { userId: user.id } }),
-    db.userWebAuthnCredential.findMany({
-      where: { userId: user.id },
-      select: { id: true, deviceType: true, createdAt: true, credentialId: true },
-      orderBy: { createdAt: "desc" },
-    }),
     getFeatureFlags(),
+    getEffectiveSttEngine(user.id),
+    db.userConfig.count({ where: { userId: user.id, key: { startsWith: "ai." } } }),
   ]);
   let prefs: Record<string, unknown> = {};
   try { prefs = JSON.parse(user.prefs || "{}"); } catch { prefs = {}; }
@@ -26,24 +23,20 @@ export async function GET() {
   return NextResponse.json({
     authenticated: true,
     username: user.username,
+    email: user.email,
     userId: user.id,
-    hasMpin: !!mpin,
-    hasWebauthn: webauthnCreds.length > 0,
-    passkeys: webauthnCreds.map((c) => ({
-      id: c.id,
-      deviceType: c.deviceType ?? "Unknown device",
-      createdAt: c.createdAt.toISOString(),
-      credentialIdShort: c.credentialId.slice(0, 12) + "...",
-    })),
-    // Per-user UI preferences (wallpaper, voice language, auto fingerprint…)
+    hasAppMpin: !!mpin?.appMpinHash,
+    hasDashboardMpin: !!mpin?.dashboardMpinHash,
     prefs,
-    // Feature flags (so the UI knows which upload buttons to show)
+    // Which mic engine this user's client should use: "native" or "openai-compatible"
+    sttEngine,
+    // Whether the user has configured their own AI keys (settings UI hint)
+    hasUserAi: hasUserAi > 0,
+    // Feature flags (upload buttons etc.)
     flags: {
       pdfUpload: flags.pdfUpload,
       ocr: flags.ocr,
-      sttNative: flags.sttNative,
       webPush: flags.webPush,
     },
   });
 }
-

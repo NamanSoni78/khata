@@ -686,7 +686,7 @@ function SttConfigCard({
       <CardContent className="space-y-3">
         <FlagRow
           label="Engine"
-          desc="Native = device's built-in Web Speech API (free, no key). OpenAI-compatible = a Whisper-style /audio/transcriptions endpoint."
+          desc="Native = device's built-in Web Speech API (free, no key). OpenAI-compatible = a Whisper-style /audio/transcriptions endpoint. Paste either a base URL (…/v1) or the full endpoint — wrong pastes like /chat/completions are auto-corrected."
           checked={cfg.engine === "native"}
           onChange={(v) => onChange({ ...cfg, engine: v ? "native" : "openai-compatible" })}
         />
@@ -875,8 +875,6 @@ function PromptCard({
 
 function UsersTab() {
   const [users, setUsers] = useState<any[]>([]);
-  const [newU, setNewU] = useState("");
-  const [newP, setNewP] = useState("");
 
   const load = async () => {
     const res = await fetch("/api/admin/users");
@@ -897,22 +895,6 @@ function UsersTab() {
     return () => { active = false; };
   }, []);
 
-  const create = async () => {
-    const res = await fetch("/api/admin/users", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: newU, password: newP }),
-    });
-    if (res.ok) {
-      toast.success(`Created user ${newU}`);
-      setNewU(""); setNewP("");
-      load();
-    } else {
-      const e = await res.json();
-      toast.error(e.error ?? "Failed");
-    }
-  };
-
   const toggle = async (userId: string, isActive: boolean) => {
     await fetch("/api/admin/users", {
       method: "PATCH",
@@ -927,32 +909,20 @@ function UsersTab() {
       <CardHeader>
         <CardTitle>Users</CardTitle>
         <p className="text-xs text-muted-foreground mt-1">
-          Each user&apos;s data is strictly isolated — accounts, contacts, transactions and chats are never shared.
+          Users create their own accounts (Gmail + OTP verification) from the app. Data is strictly
+          isolated — accounts, contacts, transactions and chats are never shared. Flip a switch to
+          suspend an account.
         </p>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-2">
-          <Input
-            placeholder="username"
-            value={newU}
-            onChange={(e) => setNewU(e.target.value)}
-          />
-          <Input
-            placeholder="password"
-            type="password"
-            value={newP}
-            onChange={(e) => setNewP(e.target.value)}
-          />
-          <Button onClick={create}><Plus className="w-4 h-4 mr-1" /> Add user</Button>
-        </div>
         <div className="border border-border rounded-xl overflow-x-auto">
           <table className="w-full text-sm min-w-[560px]">
             <thead className="bg-muted/60 text-muted-foreground">
               <tr>
-                <th className="text-left p-2.5 font-medium">Username</th>
+                <th className="text-left p-2.5 font-medium">Gmail</th>
+                <th className="text-left p-2.5 font-medium">Name</th>
                 <th className="text-right p-2.5 font-medium">Accounts</th>
                 <th className="text-right p-2.5 font-medium">Txns</th>
-                <th className="text-right p-2.5 font-medium">Messages</th>
                 <th className="text-left p-2.5 font-medium">Created</th>
                 <th className="p-2.5 font-medium">Active</th>
               </tr>
@@ -960,10 +930,10 @@ function UsersTab() {
             <tbody>
               {users.map((u) => (
                 <tr key={u.id} className="border-t border-border">
+                  <td className="p-2.5 font-mono text-xs">{u.email}</td>
                   <td className="p-2.5 font-mono">{u.username}</td>
                   <td className="p-2.5 text-right tnum">{u._count?.accounts ?? 0}</td>
                   <td className="p-2.5 text-right tnum">{u._count?.transactions ?? 0}</td>
-                  <td className="p-2.5 text-right tnum">{u._count?.chatMessages ?? 0}</td>
                   <td className="p-2.5 text-xs text-muted-foreground">{new Date(u.createdAt).toLocaleDateString("en-IN")}</td>
                   <td className="p-2.5">
                     <Switch checked={u.isActive} onCheckedChange={(v) => toggle(u.id, v)} />
@@ -1007,8 +977,8 @@ function DbStatusTab() {
             <li>ADMIN_USERNAME / ADMIN_PASSWORD: {status.env.hasAdminCreds ? "✓ set" : "✗ missing"}</li>
             <li>VAPID keys (public+private): {status.env.hasVapidKeys ? "✓ set" : "✗ missing (needed for push) — run `bun run gen-vapid`"}</li>
             <li>VAPID_SUBJECT: {status.env.hasVapidSubject ? "✓ set" : "— optional but recommended"}</li>
-            <li>QSTASH_TOKEN: {status.env.hasQStash ? "✓ set" : "✗ missing (needed for scheduled reminders)"}</li>
-            <li>NEXT_PUBLIC_RP_ID: {status.env.hasRpIdOverride ? "✓ set" : "— auto-derived from hostname"}</li>
+            <li>QSTASH_TOKEN: {status.env.hasQStash ? `✓ set (${status.env.qstashAccounts} account${status.env.qstashAccounts > 1 ? "s" : ""} pooled)` : "✗ missing (needed for scheduled reminders)"}</li>
+            <li>RESEND_API_KEY: {status.env.hasResend ? "✓ set (email/OTP works)" : "✗ missing (signup emails won't send)"}</li>
           </ul>
         </div>
       </CardContent>

@@ -39,6 +39,8 @@
 const TICK_INTERVAL_MS = 30 * 1000; // 30 s
 const LOOPBACK_TOKEN_HEADER = "X-Internal-Scheduler";
 
+import { primaryAccount } from "@/lib/qstash-pool";
+
 let _started = false;
 let _timer: NodeJS.Timeout | null = null;
 let _appUrl: string | null = null;
@@ -59,12 +61,12 @@ function resolveAppUrl(): string {
 }
 
 function resolveToken(): string {
-  if (_token) return _token;
-  // The cron endpoint accepts the QSTASH_TOKEN bearer when QSTASH_TOKEN is
-  // set. When it isn't (local dev / no-QStash deployment), the cron endpoint
-  // is left open. We additionally pass our own header so the endpoint can
-  // recognize self-triggered calls and log them differently if desired.
-  _token = process.env.QSTASH_TOKEN ?? LOOPBACK_TOKEN_HEADER;
+  // The cron endpoint accepts any pooled QSTASH_TOKEN bearer when QStash env
+  // vars are set. When they aren't (local dev / no-QStash deployment), the
+  // cron endpoint is left open. We additionally pass our own header so the
+  // endpoint can recognize self-triggered calls and log them differently if
+  // desired.
+  _token = primaryAccount()?.token ?? LOOPBACK_TOKEN_HEADER;
   return _token;
 }
 
@@ -73,10 +75,10 @@ async function tick() {
   const base = resolveAppUrl().replace(/\/$/, "");
   const url = `${base}/api/notifications/cron`;
   const token = resolveToken();
-  // If QSTASH_TOKEN is set, send it as Bearer so the cron auth check passes.
+  // If a QStash token is set, send it as Bearer so the cron auth check passes.
   // If not, send our internal header — the cron endpoint will be in "open"
   // mode (no env vars) and accept the request anyway.
-  const isRealToken = !!(process.env.QSTASH_TOKEN && process.env.QSTASH_TOKEN.length > 0);
+  const isRealToken = !!primaryAccount()?.token;
   try {
     // AbortSignal.timeout is Node 17.3+ / all modern browsers — guard for
     // older runtimes where it's missing.

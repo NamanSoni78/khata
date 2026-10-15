@@ -22,6 +22,12 @@
  * is a deterministic ±5:30 shift. All Date objects are UTC under the hood.
  */
 import { db } from "@/lib/db";
+import {
+  pickAccountForNewSchedule,
+  pickAccountForPublish,
+  accountForIndex,
+  primaryAccount,
+} from "@/lib/qstash-pool";
 
 const IST_OFFSET_MIN = 5 * 60 + 30; // IST = UTC + 5:30
 
@@ -211,6 +217,8 @@ export function istReminderToUTCCron(rem: ReminderShape): string | null {
 
 // ============================================================
 //  QStash REST client (no SDK dependency — plain fetch)
+//  Multi-account: schedules spread across pooled accounts (qstash-pool.ts),
+//  one-time publishes rotate round-robin.
 // ============================================================
 
 const QSTASH_BASE = "https://qstash.upstash.io/v2";
@@ -232,8 +240,10 @@ function cronUrl(reminderId: string): string {
 }
 
 /**
- * Create a QStash schedule for a recurring reminder (exact-minute delivery).
- * Returns the scheduleId, or null when QStash isn't configured / not applicable.
+ * Create a QStash schedule for a recurring reminder (exact-minute delivery)
+ * on the least-loaded pooled account.
+ * Returns { scheduleId, accountIndex }, or null when QStash isn't
+ * configured / not applicable.
  */
 export async function createQStashScheduleForReminder(reminder: {
   id: string;
@@ -241,18 +251,21 @@ export async function createQStashScheduleForReminder(reminder: {
   time: string;
   daysOfWeek?: string | null;
   dayOfMonth?: number | null;
-}): Promise<string | null> {
+}): Promise<{ scheduleId: string; accountIndex: number } | null> {
   if (!isQStashConfigured()) return null;
   if (reminder.type === "once") return null; // one-timers use delayed publish
 
   const cron = istReminderToUTCCron(reminder);
   if (!cron) return null;
 
+  const account = await pickAccountForNewSchedule();
+  if (!account) return null;
+
   try {
     const res = await fetch(`${QSTASH_BASE}/schedules`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.QSTASH_TOKEN}`,
+        Authorization: `Bearer ${account.token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -261,24 +274,30 @@ export async function createQStashScheduleForReminder(reminder: {
       }),
     });
     if (!res.ok) {
-      console.error("[qstash] schedule create failed:", res.status, await res.text());
+      console.error(`[qstash] schedule create failed (acct ${account.index}):`, res.status, await res.text());
       return null;
     }
     const json = await res.json();
-    return json.scheduleId ?? null;
+    if (!json.scheduleId) return null;
+    return { scheduleId: json.scheduleId, accountIndex: account.index };
   } catch (e) {
     console.error("[qstash] schedule create error:", e);
     return null;
   }
 }
 
-/** Delete a QStash schedule (when a reminder is deleted / paused). */
-export async function deleteQStashSchedule(scheduleId: string | null | undefined): Promise<void> {
+/** Delete a QStash schedule on the account that created it. */
+export async function deleteQStashSchedule(
+  scheduleId: string | null | undefined,
+  accountIndex?: number | null
+): Promise<void> {
   if (!scheduleId || !isQStashConfigured()) return;
+  const account = accountForIndex(accountIndex) ?? primaryAccount();
+  if (!account) return;
   try {
     await fetch(`${QSTASH_BASE}/schedules/${scheduleId}`, {
       method: "DELETE",
-      headers: { Authorization: `Bearer ${process.env.QSTASH_TOKEN}` },
+      headers: { Authorization: `Bearer ${account.token}` },
     });
   } catch (e) {
     console.error("[qstash] schedule delete error:", e);
@@ -288,7 +307,8 @@ export async function deleteQStashSchedule(scheduleId: string | null | undefined
 /**
  * One-time reminders: publish a delayed message that fires at the exact time.
  * QStash max delay is 7 days — for further-out one-timers, fall back to polling
- * (nextRunAt comparison) until within 7 days.
+ * (nextRunAt comparison) until within 7 days. Publishes rotate across pooled
+ * accounts to spread quota usage.
  */
 export async function publishOneTimeQStash(reminder: {
   id: string;
@@ -297,11 +317,13 @@ export async function publishOneTimeQStash(reminder: {
   if (!isQStashConfigured() || !reminder.nextRunAt) return false;
   const delaySec = Math.floor((reminder.nextRunAt.getTime() - Date.now()) / 1000);
   if (delaySec <= 0 || delaySec > 6 * 24 * 60 * 60) return false; // >6 days out: let poll handle later
+  const account = pickAccountForPublish();
+  if (!account) return false;
   try {
     const res = await fetch(`${QSTASH_BASE}/publish/${encodeURIComponent(cronUrl(reminder.id))}`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.QSTASH_TOKEN}`,
+        Authorization: `Bearer ${account.token}`,
         "Content-Type": "application/json",
         // Upstash delay header (seconds)
         "Upstash-Delay": `${delaySec}s`,
@@ -350,11 +372,11 @@ export async function createReminder(userId: string, input: ReminderInput) {
     if (row.type === "once") {
       await publishOneTimeQStash({ id: row.id, nextRunAt: row.nextRunAt });
     } else {
-      const scheduleId = await createQStashScheduleForReminder(row);
-      if (scheduleId) {
+      const created = await createQStashScheduleForReminder(row);
+      if (created) {
         await db.scheduledNotification.update({
           where: { id: row.id },
-          data: { qstashScheduleId: scheduleId },
+          data: { qstashScheduleId: created.scheduleId, qstashAccount: created.accountIndex },
         });
       }
     }
@@ -366,7 +388,7 @@ export async function createReminder(userId: string, input: ReminderInput) {
 export async function deleteReminder(userId: string, id: string) {
   const row = await db.scheduledNotification.findFirst({ where: { id, userId } });
   if (!row) return;
-  await deleteQStashSchedule(row.qstashScheduleId);
+  await deleteQStashSchedule(row.qstashScheduleId, row.qstashAccount);
   await db.scheduledNotification.delete({ where: { id: row.id } }).catch(() => {});
 }
 
@@ -374,7 +396,7 @@ export async function pauseReminder(userId: string, id: string, isActive: boolea
   const row = await db.scheduledNotification.findFirst({ where: { id, userId } });
   if (!row) return;
   if (!isActive && row.qstashScheduleId) {
-    await deleteQStashSchedule(row.qstashScheduleId);
+    await deleteQStashSchedule(row.qstashScheduleId, row.qstashAccount);
   }
   await db.scheduledNotification.update({
     where: { id: row.id },
@@ -386,9 +408,12 @@ export async function pauseReminder(userId: string, id: string, isActive: boolea
   });
   if (isActive && row.type !== "once") {
     // Re-register the exact-time schedule on resume
-    const scheduleId = await createQStashScheduleForReminder(row);
-    if (scheduleId) {
-      await db.scheduledNotification.update({ where: { id: row.id }, data: { qstashScheduleId: scheduleId } });
+    const created = await createQStashScheduleForReminder(row);
+    if (created) {
+      await db.scheduledNotification.update({
+        where: { id: row.id },
+        data: { qstashScheduleId: created.scheduleId, qstashAccount: created.accountIndex },
+      });
     }
   }
 }

@@ -8,19 +8,16 @@ export default async function Home() {
   const user = await getSessionUser(token, "daily");
 
   if (!user || user.id === "admin") {
-    // Not logged in — show login screen
-    return <DailyApp initialStage="login" />;
+    // Not logged in — landing (client checks localStorage for a remembered
+    // email and shows the MPIN unlock screen when one exists).
+    return <DailyApp initialAuthStage="landing" />;
   }
 
-  // Logged in. Check if MPIN is set up.
+  // Session exists. If MPIN isn't set up yet, finish setup; otherwise lock.
   const mpin = await db.userMpin.findUnique({ where: { userId: user.id } });
-  const webauthnCount = await db.userWebAuthnCredential.count({ where: { userId: user.id } });
-
-  if (!mpin && webauthnCount === 0) {
-    return <DailyApp initialStage="mpin-setup" username={user.username} userId={user.id} />;
+  if (!mpin?.appMpinHash) {
+    return <DailyApp initialAuthStage="mpin-setup" username={user.username} email={user.email} />;
   }
 
-  // MPIN or WebAuthn exists — show unlock screen. Passing hasWebauthn lets the
-  // client start the fingerprint flow instantly instead of waiting for /api/auth/me.
-  return <DailyApp initialStage="unlock" username={user.username} hasWebauthn={webauthnCount > 0} />;
+  return <DailyApp initialAuthStage="unlock" username={user.username} email={user.email} />;
 }

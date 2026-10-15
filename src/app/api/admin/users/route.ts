@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
 import { db } from "@/lib/db";
-import { hashPassword } from "@/lib/auth/credentials";
 
 async function requireAdmin() {
   const token = await getSessionToken("admin");
@@ -20,7 +19,9 @@ export async function GET() {
     where: { id: { not: "admin" } }, // exclude the admin pseudo-user
     select: {
       id: true,
+      email: true,
       username: true,
+      emailVerified: true,
       isActive: true,
       createdAt: true,
       _count: { select: { accounts: true, transactions: true, chatMessages: true } },
@@ -28,34 +29,6 @@ export async function GET() {
     orderBy: { createdAt: "desc" },
   });
   return NextResponse.json({ users });
-}
-
-// POST: create a new user
-export async function POST(req: NextRequest) {
-  if (!(await requireAdmin())) {
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  }
-  const { username, password } = await req.json();
-  if (!username || !password) {
-    return NextResponse.json({ error: "Missing username or password" }, { status: 400 });
-  }
-  if (username.length < 3) {
-    return NextResponse.json({ error: "Username must be at least 3 chars" }, { status: 400 });
-  }
-  if (password.length < 6) {
-    return NextResponse.json({ error: "Password must be at least 6 chars" }, { status: 400 });
-  }
-
-  const existing = await db.user.findUnique({ where: { username } });
-  if (existing) {
-    return NextResponse.json({ error: "Username already exists" }, { status: 409 });
-  }
-
-  const hash = await hashPassword(password);
-  const user = await db.user.create({
-    data: { username, passwordHash: hash },
-  });
-  return NextResponse.json({ ok: true, userId: user.id, username });
 }
 
 // PATCH: enable/disable a user

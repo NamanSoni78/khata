@@ -1,73 +1,95 @@
-# Khata — Deploy Guide
+# Deploying Khata — Vercel + Turso + Resend (khata.namansoni.in)
 
-A production-grade multi-tenant personal-finance PWA built on Next.js 16 App Router.
-**Production URL: https://khata.namansoni.in**
+A ~15-minute walkthrough from zero to production.
 
-## Routes
-- `/`         daily PWA — chat + voice logging, balances, charts, reminders, markdown replies
-- `/dashboard` weekly deep-dive + AI agent + imports + exports + reminders + mindmap editor
-- `/admin`    developer / multi-tenant control panel (env-var auth)
+---
 
-## Stack
-- Next.js 16 (App Router, RSC)
-- Tailwind 4 + shadcn/ui
-- Prisma ORM + Neon serverless Postgres
-- Credentials auth + @simplewebauthn/server passkeys + bcrypt MPIN
-- Recharts, React Flow, PDFKit
-- LLM: OpenAI-compatible + Anthropic dual protocol (keys configured in /admin, not env)
-- Web Push (VAPID) + Upstash QStash scheduling
+## 0. Prerequisites
 
-## 1. Install
+- GitHub repo with this project pushed
+- Accounts: [Turso](https://turso.tech) (free DB), [Resend](https://resend.com) (free emails),
+  [Upstash](https://upstash.com) (free QStash), [Vercel](https://vercel.com)
+
+## 1. Database — Turso
+
+1. Create a database (pick a region near India, e.g. `aws-ap-southeast-1`).
+2. Open **`KHATA_DB_SETUP.ipynb`** (repo root) in Google Colab:
+   - Upload the project zip to the notebook
+   - Paste your **Database URL** (`libsql://…`) and **Auth Token** in the form cell
+   - Run all cells → schema + defaults are pushed and verified
+3. Keep the URL + token handy — they go into Vercel next.
+
+> Local alternative (no Colab): `TURSO_DATABASE_URL=… TURSO_AUTH_TOKEN=… bun run turso:setup`
+
+## 2. Email — Resend (OTP + password reset)
+
+1. In Resend → **Domains** → add `khata.namansoni.in` and add the DKIM/SPF DNS records it shows.
+2. Create an API key (`re_…`).
+3. Mail will be sent from **`Khata <no-reply@khata.namansoni.in>`**
+   (override with `RESEND_FROM`). Free tier: 100 mails/day — plenty for OTPs.
+
+## 3. Web Push keys (VAPID)
+
 ```bash
-bun install        # or: pnpm i / npm i
+bun run gen-vapid
 ```
 
-## 2. Configure env
-```bash
-cp .env.example .env
-# fill in DATABASE_URL (Neon pooled string), ADMIN_USERNAME, ADMIN_PASSWORD
-# optional: NEXT_PUBLIC_APP_URL, NEXT_PUBLIC_RP_ID, VAPID_*, QSTASH_*
-```
+## 4. Vercel
 
-## 3. Database
-```bash
-bunx prisma generate
-bunx prisma db push
-bun run db:seed     # default agent configs, flags, glossary, uxConfig
-```
+Import the repo, then set these env vars (Production **and** Preview):
 
-## 4. Run
-```bash
-bun run dev                 # local
-bun run build && bun start  # production
-```
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | `libsql://…` from Turso |
+| `DATABASE_AUTH_TOKEN` | token from Turso |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | your /admin credentials (bcrypt hash preferred: `bun run hash-password <pw>`) |
+| `NEXT_PUBLIC_APP_URL` | `https://khata.namansoni.in` |
+| `RESEND_API_KEY` | `re_…` from Resend |
+| `RESEND_FROM` *(optional)* | `Khata <no-reply@khata.namansoni.in>` |
+| `NEXT_PUBLIC_VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | from gen-vapid |
+| `VAPID_SUBJECT` | `mailto:you@example.com` |
+| `QSTASH_TOKEN` | token(s), **multiple allowed separated by `;`** |
+| `QSTASH_CURRENT_SIGNING_KEY` / `QSTASH_NEXT_SIGNING_KEY` | signing keys, same `;` order as tokens |
 
-## 5. Deploy to Vercel
-1. Push this folder to a Git repo.
-2. Import the repo into Vercel.
-3. Set env vars in Project Settings (see README table: DATABASE_URL, ADMIN_*, VAPID_*, QSTASH_*, NEXT_PUBLIC_APP_URL, NEXT_PUBLIC_RP_ID).
-4. Deploy. Then run once against Neon: `DATABASE_URL=... bun run db:push && DATABASE_URL=... bun run db:seed`.
-5. Set up QStash (exact-time schedules are automatic once QSTASH_TOKEN is set; add the `*/5 * * * *` catch-all cron → `https://khata.namansoni.in/api/notifications/cron`).
-6. Log into `/admin`, configure the 4 agents (presets available), create user accounts.
+**Multi-account QStash:** create 2–3 free Upstash accounts, put each account's token and keys
+in the same env var separated by `;` (order pairs them). Khata spreads recurring reminder
+schedules across the pool and accepts inbound requests signed by any account.
 
-## Post-deploy checklist
-- [ ] Agents configured + "Test connection" green for each
-- [ ] User account(s) created; MPIN + passkey set from a device
-- [ ] Reminder test: ask the chat "remind me in 1 minute to test" (or set one in dashboard)
-- [ ] Push enabled on a device; test notification received
-- [ ] Import flow smoke-tested (Copy AI prompt → paste block → Import data)
+Deploy. 🚀
 
-## Included features
-- Daily `/` chat with full analytical toolkit: live balances, date-range queries, charts, markdown
-- No tool-call JSON leaks (hardened parser + sanitizer, native + fallback modes)
-- Chat history pagination (100/page, scroll-up infinite retrieval from DB)
-- Calendar reminders (daily/weekly/monthly/once — no cron syntax anywhere) via QStash
-- Import from any AI chatbot via public/addingaccountsprompt.md (markdown/JSON/CSV)
-- Mindmap editor (React Flow): view + form edit + agentic edit, undo/redo, explicit save
-- PDF / CSV export from the dashboard
-- Dashboard deep-dive agent (50+ financial terms: IPO, SIP, FD, demat, ...)
-- 15-minute dashboard idle timeout, activity-extended
-- Text-first AI replies with "Show chart" follow-up button
-- Fingerprint auto-prompt on open, hold-to-talk mic (Hinglish-optimized STT)
-- PWA install prompt (Chrome), offline message queue, chat wallpapers
-- SEO: canonical, OG, robots.txt, sitemap.xml (no FAQ clutter)
+## 5. DNS
+
+Point `khata.namansoni.in` at Vercel (they show the `A`/`CNAME` records on project setup).
+Also keep the Resend DKIM/SPF records in place.
+
+## 6. First-run checklist
+
+1. Open `https://khata.namansoni.in` → **Create account with Gmail** →
+   OTP email arrives (check spam the first time) → set MPINs → chat works.
+2. Open `/admin` → **Agents** tab → set your default LLM (e.g. Groq
+   `https://api.groq.com/openai/v1` + key + `llama-3.3-70b-versatile`) → **Test connection**.
+3. **Speech-to-Text** tab → leave engine `native` (free, device) or set an
+   OpenAI-compatible endpoint. Paste either a base URL (`…/v1`) or the full
+   `/audio/transcriptions` endpoint — wrong pastes are auto-corrected.
+4. Users can now bring **their own keys** from `/dashboard/settings`.
+5. Optional: in Upstash, create a QStash **cron** hitting
+   `https://khata.namansoni.in/api/notifications/cron` every 5 minutes
+   (catch-all poll; exact-time delivery already uses per-reminder schedules).
+
+## 7. Operations
+
+- **Schema changes:** edit `prisma/schema.prisma`, re-run the Colab notebook
+  (it skips existing tables) or `bun run turso:setup`.
+- **Reseed defaults:** re-run the notebook's setup cell (upserts only).
+- **User issues:** `/admin` → Users → flip Active. Users self-signup with Gmail.
+- **Logs:** Vercel → Deployments → Functions logs.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Signup says "email isn't configured" | `RESEND_API_KEY` missing in Vercel env |
+| OTP mails in spam | complete Resend domain verification (DKIM/SPF) |
+| 500 on login/chat | `DATABASE_URL`/`DATABASE_AUTH_TOKEN` wrong → check Turso token |
+| Reminders don't fire | check `QSTASH_TOKEN` + the catch-all cron (step 6.5) |
+| "The assistant isn't set up yet" | configure the daily agent in `/admin` |

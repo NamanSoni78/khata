@@ -140,7 +140,7 @@ export default function DeepDiveChat() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               placeholder="Ask anything about your finances…"
-              className="w-full resize-none bg-transparent px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none min-h-[44px] max-h-[120px]"
+              className="w-full resize-none bg-transparent px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/75 focus:outline-none min-h-[44px] max-h-[120px]"
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();

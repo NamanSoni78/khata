@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
 import { db } from "@/lib/db";
+import { getQStashAccounts } from "@/lib/qstash-pool";
+import { isEmailConfigured } from "@/lib/email";
 
 export async function GET() {
   const token = await getSessionToken("admin");
@@ -29,15 +31,17 @@ export async function GET() {
   return NextResponse.json({
     counts: { users, accounts, transactions, contacts, categories, chatMessages, adminConfigs },
     database: {
-      provider: "sqlite", // swap to "postgresql" on Neon deploy
+      provider: "sqlite (libSQL / Turso)",
       urlMasked: process.env.DATABASE_URL?.replace(/:[^:@]+@/, ":****@"),
+      remote: /^libsql:|^wss:|^https:/i.test(process.env.DATABASE_URL ?? ""),
     },
     env: {
       hasAdminCreds: !!(process.env.ADMIN_USERNAME && process.env.ADMIN_PASSWORD),
       hasVapidKeys: !!(process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY),
       hasVapidSubject: !!process.env.VAPID_SUBJECT,
-      hasQStash: !!process.env.QSTASH_TOKEN,
-      hasRpIdOverride: !!process.env.NEXT_PUBLIC_RP_ID,
+      qstashAccounts: getQStashAccounts().length,
+      hasQStash: getQStashAccounts().length > 0,
+      hasResend: isEmailConfigured(),
     },
   });
 }

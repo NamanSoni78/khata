@@ -1,26 +1,29 @@
 /**
- * Agent conversation loop:
- * 1. Build system prompt (with time + schema + recent txns)
- * 2. Load last N chat messages from DB (N admin-configurable)
- * 3. Call LLM with user's new message
- * 4. If LLM returned tool calls, dispatch them, append results, call LLM again
- * 5. Repeat until no more tool calls (or 5 iterations max)
- * 6. Persist final assistant message + return to caller
+ * Agent conversation orchestrator — persistence layer on top of the
+ * toolkit's runToolLoop.
  *
- * Final assistant text is ALWAYS run through `sanitizeAssistantText` so users
- * never see leaked {"tool_call":...} JSON, and through `extractChartMarker` so
- * the [CHART:{...}] spec rides along in metadata (not in the visible bubble).
+ *  1. Build system prompt (time + schema + recent txns + user instructions)
+ *  2. Load last N chat messages from DB (N admin-configurable)
+ *  3. Persist the user's new message
+ *  4. runToolLoop (the SDK): tool calls, repairs, retries, self-correction
+ *  5. Persist every assistant/tool turn the SDK appended, then the final
+ *     assistant message
+ *  6. Post-process: chart markers, multi-leg auto-linking
+ *
+ * If the provider is genuinely unreachable (transport exhausted), the
+ * orphan user message is removed so history never shows unanswered mail.
  */
 import { db } from "@/lib/db";
-import { chatComplete, type LLMMessage, type ToolDefinition } from "@/lib/llm/client";
-import { sanitizeAssistantText } from "@/lib/llm/json-tool-parser";
+import type { ToolDefinition, ToolCall } from "@/lib/llm/client";
+import { sanitizeAssistantText } from "@/lib/toolkit/parse";
+import { runToolLoop, registryFromDefs, type ToolkitMessage } from "@/lib/toolkit";
 import { extractChartMarker, type ChartSpec } from "@/lib/agent/chart-marker";
 import type { AgentConfig } from "@/lib/admin-config";
 import { getSchemaMode } from "@/lib/admin-config";
+import { getUserInstructions } from "@/lib/user-config";
 import { dispatchTool } from "./tools";
 import { buildDailySystemPrompt, buildDashboardSystemPrompt } from "./prompt-builder";
 
-const MAX_TOOL_ITERATIONS = 5;
 const DEFAULT_HISTORY_LIMIT = 24; // last N chat messages fed to the LLM
 
 export interface AgentRunResult {
@@ -28,6 +31,8 @@ export interface AgentRunResult {
   chartSpec: ChartSpec | null;
   toolCalls: Array<{ name: string; args: Record<string, unknown>; result: string }>;
   tokensUsed: number;
+  /** SDK-level notes (repairs applied, degradations) — for admin logs. */
+  diagnostics?: string[];
 }
 
 type ChatHistoryRow = Awaited<ReturnType<typeof db.chatMessage.findMany>>;
@@ -41,12 +46,19 @@ export async function runAgent(opts: {
 }): Promise<AgentRunResult> {
   const { userId, userMessage, agentType, config, tools } = opts;
 
-  // 1. Build system prompt
+  // 1. Build system prompt (+ the user's own custom instructions, if any)
   const basePrompt = config.systemPrompt || "";
-  const systemPrompt =
+  let systemPrompt =
     agentType === "daily"
       ? await buildDailySystemPrompt(userId, basePrompt)
       : await buildDashboardSystemPrompt(userId, basePrompt);
+  try {
+    const ins = await getUserInstructions(userId);
+    const custom = (agentType === "daily" ? ins.daily : ins.dashboard)?.trim();
+    if (custom) {
+      systemPrompt += `\n\n=== USER CUSTOM INSTRUCTIONS (set by the user — follow faithfully) ===\n${custom}`;
+    }
+  } catch { /* instructions are best-effort */ }
 
   // 2. Load history (admin-configurable window; older turns stay reachable
   //    via the search_chat_history tool — effectively infinite context)
@@ -67,8 +79,8 @@ export async function runAgent(opts: {
     data: { userId, role: "user", content: userMessage, metadata: "{}" },
   });
 
-  // If the LLM call fails (bad key, provider down, network), remove the orphan
-  // user message so the chat history doesn't show unanswered messages.
+  // If the LLM call fails (bad key, provider down after retries, network),
+  // remove the orphan user message so history doesn't show unanswered messages.
   try {
     return await runAgentInner({ userId, userMessage, agentType, config, tools, history, systemPrompt });
   } catch (e) {
@@ -88,12 +100,12 @@ async function runAgentInner(opts: {
 }): Promise<AgentRunResult> {
   const { userId, config, tools, history, systemPrompt, userMessage } = opts;
 
-  // 4. Build the message list
-  const messages: LLMMessage[] = [{ role: "system", content: systemPrompt }];
+  // 4. Build the conversation in toolkit shape
+  const messages: ToolkitMessage[] = [{ role: "system", content: systemPrompt }];
   for (const h of history) {
     if (h.role === "tool") {
       const meta = JSON.parse(h.metadata || "{}");
-      messages.push({ role: "tool", content: h.content, toolCallId: meta.toolCallId });
+      messages.push({ role: "tool", content: h.content, toolCallId: meta.toolCallId, name: meta.toolName });
     } else if (h.role === "assistant") {
       const meta = JSON.parse(h.metadata || "{}");
       messages.push({
@@ -107,114 +119,67 @@ async function runAgentInner(opts: {
   }
   messages.push({ role: "user", content: userMessage });
 
-  // 5. Tool-calling loop
-  const executedToolCalls: AgentRunResult["toolCalls"] = [];
-  // Track tool calls dispatched in this turn (name + arg hash) so we can
-  // detect duplicates. Without this, an over-eager model that keeps emitting
-  // the same call (e.g., "log 200rs zomato" repeated 5x) hits the iteration
-  // limit AND creates 5 duplicate txns before stopping.
-  const dispatchedKeys = new Set<string>();
-  let iteration = 0;
-  let lastAssistantText = "";
+  const runStart = messages.length; // everything appended after this = this run
 
-  while (iteration < MAX_TOOL_ITERATIONS) {
-    iteration++;
-    const res = await chatComplete(config, messages, tools);
+  // 5. Run the SDK loop — tool calling that can't fail the turn
+  const registry = registryFromDefs(tools, dispatchTool);
+  const result = await runToolLoop({
+    config,
+    messages,
+    registry,
+    ctx: { userId },
+  });
 
-    // If model returned tool calls, dispatch and continue
-    if (res.toolCalls.length > 0) {
-      // Filter out duplicate calls — same (name + args) already dispatched
-      const uniqueToolCalls = res.toolCalls.filter((tc) => {
-        const key = `${tc.name}::${JSON.stringify(tc.arguments)}`;
-        if (dispatchedKeys.has(key)) return false;
-        dispatchedKeys.add(key);
-        return true;
-      });
-
-      // If ALL the calls in this turn are duplicates of calls we already
-      // dispatched, the model is stuck in a loop. Stop here with the text
-      // it produced, rather than re-dispatching + hitting the iteration limit.
-      if (uniqueToolCalls.length === 0) {
-        lastAssistantText = sanitizeAssistantText(res.content || lastAssistantText);
-        await persistFinalAssistantMessage(userId, lastAssistantText, {
-          toolCalls: [],
-          duplicateSkipped: res.toolCalls.length,
-        });
-        break;
-      }
-
-      // Append the assistant's tool-call message (use the UNIQUE subset —
-      // otherwise the model sees its own duplicate calls echoed back and
-      // gets even more confused about whether to stop)
-      messages.push({
-        role: "assistant",
-        content: res.content,
-        toolCalls: uniqueToolCalls,
-      });
-      // Persist this assistant turn (with the unique tool calls) to DB.
-      // The content is sanitized so history never carries leaked JSON either.
+  // 6. Persist the turns the SDK appended (assistant tool-call turns and
+  //    tool results — synthetic nudge user messages are skipped)
+  for (const m of messages.slice(runStart)) {
+    if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
       await db.chatMessage.create({
         data: {
           userId,
           role: "assistant",
-          content: sanitizeAssistantText(res.content ?? ""),
-          metadata: JSON.stringify({ toolCalls: uniqueToolCalls }),
+          content: m.content, // already sanitized by the SDK
+          metadata: JSON.stringify({ toolCalls: m.toolCalls }),
         },
       });
-
-      // Dispatch each unique tool call and append tool result message
-      for (const tc of uniqueToolCalls) {
-        const result = await dispatchTool(tc.name, userId, tc.arguments);
-        executedToolCalls.push({ name: tc.name, args: tc.arguments, result });
-        messages.push({
+    } else if (m.role === "tool") {
+      await db.chatMessage.create({
+        data: {
+          userId,
           role: "tool",
-          content: result,
-          toolCallId: tc.id,
-          name: tc.name,
-        });
-        // Persist tool result to chat history
-        await db.chatMessage.create({
-          data: {
-            userId,
-            role: "tool",
-            content: result,
-            metadata: JSON.stringify({ toolCallId: tc.id, toolName: tc.name }),
-          },
-        });
-      }
-      // Continue the loop to let the model summarize the tool results
-      lastAssistantText = sanitizeAssistantText(res.content);
-      continue;
+          content: m.content,
+          metadata: JSON.stringify({ toolCallId: m.toolCallId, toolName: m.name }),
+        },
+      });
     }
-
-    // No tool calls — final text response
-    lastAssistantText = sanitizeAssistantText(res.content);
-    await persistFinalAssistantMessage(userId, lastAssistantText, { toolCalls: [] });
-    break;
+    // user-role synthetic nudges: intentionally not persisted
   }
 
-  if (iteration >= MAX_TOOL_ITERATIONS) {
-    lastAssistantText = lastAssistantText || "(the assistant took too many steps — please try again)";
-  }
+  // 7. Persist the final assistant message
+  const finalText = result.finalContent || "(no response)";
+  await persistFinalAssistantMessage(userId, finalText, {
+    toolCalls: [],
+  });
 
-  // === POST-PROCESSING: AUTO-LINK MULTI-LEG TXNS ===
-  // If the agent called multiple log_* / mark_event tools in this turn
-  // and at least one had group_label, link all txns from this turn to that
-  // group (covers cases where the LLM forgot group_label on some legs).
-  await autoLinkTurnTxnsToGroup(userId, executedToolCalls);
+  // 8. Post-processing: auto-link multi-leg txns
+  await autoLinkTurnTxnsToGroup(userId, result.toolCalls);
 
-  // Extract chart marker (if the agent offered a chart) so the UI can render
-  // a "Show as chart" button. Persisted text stays clean; spec rides in metadata.
-  const { cleanText, chartSpec } = extractChartMarker(lastAssistantText);
+  // 9. Extract chart marker (if the agent offered a chart)
+  const { cleanText, chartSpec } = extractChartMarker(finalText);
   if (chartSpec) {
     await attachChartSpecToLastMessage(userId, chartSpec);
+  }
+
+  if (result.diagnostics.length > 0) {
+    console.log(`[agent:${opts.agentType}] ${result.diagnostics.join(" | ")}`);
   }
 
   return {
     assistantText: cleanText,
     chartSpec,
-    toolCalls: executedToolCalls,
+    toolCalls: result.toolCalls.map((c) => ({ name: c.name, args: c.args, result: c.result })),
     tokensUsed: 0,
+    diagnostics: result.diagnostics,
   };
 }
 
@@ -258,15 +223,13 @@ async function attachChartSpecToLastMessage(userId: string, chartSpec: ChartSpec
  */
 async function autoLinkTurnTxnsToGroup(
   userId: string,
-  executedToolCalls: AgentRunResult["toolCalls"]
+  executedToolCalls: Array<{ name: string; args: Record<string, unknown>; result: string }>
 ): Promise<void> {
-  // Find the first group_label among the calls
   const groupLabel = executedToolCalls
     .map((c) => c.args.group_label as string | undefined)
     .find((l) => l);
   if (!groupLabel) return;
 
-  // Collect all txn IDs created in this turn (from result strings containing "Txn ID: ...")
   const txnIds: string[] = [];
   for (const call of executedToolCalls) {
     const matches = call.result.match(/Txn ID: (\w+)/g);
@@ -279,7 +242,6 @@ async function autoLinkTurnTxnsToGroup(
   }
   if (txnIds.length < 2) return;
 
-  // Find or create the group
   let group = await db.transactionGroup.findFirst({
     where: { userId, label: { contains: groupLabel } },
   });
@@ -289,9 +251,12 @@ async function autoLinkTurnTxnsToGroup(
     });
   }
 
-  // Link any unlinked txns from this turn to this group
   await db.transaction.updateMany({
     where: { id: { in: txnIds }, userId, groupId: null },
     data: { groupId: group.id },
   });
 }
+
+// Re-export for callers that imported it from loop.ts previously
+export { sanitizeAssistantText };
+export type { ToolCall };

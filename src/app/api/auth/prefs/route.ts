@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
   }
 
   // Whitelisted preference keys (defensive — nothing arbitrary gets stored)
-  const ALLOWED = ["wallpaper", "voiceLang", "autoFingerprint"];
+  const ALLOWED = ["wallpaper", "voiceLang"];
   const patch: Record<string, unknown> = {};
   for (const k of ALLOWED) {
     if (k in body) patch[k] = body[k];

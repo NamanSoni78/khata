@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { sendPushToUser, resolveMessageTemplate, isWebPushConfigured } from "@/lib/notifications/push";
 import { computeNextRun } from "@/lib/scheduler";
+import { allTokens, allSigningKeys } from "@/lib/qstash-pool";
 // Self-start the in-process scheduler the first time this module loads on
 // any warm instance. It's idempotent and unref'd, so it never blocks shutdown.
 import { startInProcessScheduler } from "@/lib/notifications/scheduler";
@@ -136,14 +137,14 @@ async function fireReminder(
 // ============================================================
 
 async function verifyQStashRequest(req: NextRequest): Promise<{ ok: boolean; reason?: string }> {
-  const token = process.env.QSTASH_TOKEN;
-  const signingKeys = [
-    process.env.QSTASH_CURRENT_SIGNING_KEY,
-    process.env.QSTASH_NEXT_SIGNING_KEY,
-  ].filter(Boolean) as string[];
+  // Multi-account support: QSTASH_TOKEN / signing keys may hold several
+  // ";"-separated accounts. Inbound requests are accepted if they match ANY
+  // account's bearer token or ANY account's signing key.
+  const tokens = allTokens();
+  const signingKeys = allSigningKeys();
 
   // No auth configured (local dev) — allow.
-  if (!token && signingKeys.length === 0) return { ok: true };
+  if (tokens.length === 0 && signingKeys.length === 0) return { ok: true };
 
   // 0. Internal self-trigger from the in-process scheduler. The header value
   //    isn't a secret (it's just "1") — but a request bearing it can only have
@@ -154,11 +155,11 @@ async function verifyQStashRequest(req: NextRequest): Promise<{ ok: boolean; rea
     return { ok: true };
   }
 
-  // 1. Bearer token check
-  if (token) {
+  // 1. Bearer token check (any pooled account)
+  if (tokens.length > 0) {
     const authHeader = req.headers.get("authorization");
     const bearer = authHeader?.replace(/^Bearer\s+/i, "");
-    if (bearer && bearer === token) return { ok: true };
+    if (bearer && tokens.includes(bearer)) return { ok: true };
   }
 
   // 2. Upstash server signature check (JWT in Upstash-Signature header).

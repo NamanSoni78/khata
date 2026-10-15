@@ -1,9 +1,9 @@
-// Khata PWA Service Worker — offline shell + push + background sync
+// Khata PWA Service Worker — offline shell + push (WhatsApp-style v5)
 // - Caches app shell for offline fallback (cache-first on / route)
 // - Listens for push events (Phase 3 will activate the displayNotification)
 // - Listens for "sync" event (Phase 3 will flush queued messages via Background Sync API)
 
-const CACHE_NAME = "khata-v4";
+const CACHE_NAME = "khata-v5";
 const APP_SHELL = [
   "/",
   "/manifest.json",

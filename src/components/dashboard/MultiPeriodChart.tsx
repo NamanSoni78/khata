@@ -37,17 +37,33 @@ export function MultiPeriodChart({ title, buckets, granularity }: Props) {
   }));
 
   return (
-    <div className="bg-card border border-border rounded-2xl">
+    <div className="bg-card border border-border rounded-2xl" style={{ boxShadow: "var(--shadow-2)" }}>
       <div className="px-5 pt-5 pb-3">
         <h2 className="font-semibold text-sm text-foreground">{title}</h2>
       </div>
       <div className="px-5 pb-5">
-        {data.length === 0 ? (
-          <p className="text-muted-foreground text-sm py-10 text-center">No transactions in this range.</p>
+        {/* Empty account: show a friendly hint instead of a bare axis frame */}
+        {data.length === 0 || data.every((d) => !d.income && !d.expense) ? (
+          <div className="py-12 text-center">
+            <p className="text-muted-foreground text-sm">Nothing logged in this period yet.</p>
+            <p className="text-muted-foreground/70 text-xs mt-1.5">
+              Open the app and tell it what you spent today — charts fill in as you go.
+            </p>
+          </div>
         ) : (
           <ResponsiveContainer width="100%" height={280}>
             <BarChart data={data}>
-              <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+              <defs>
+                <linearGradient id="khata-income-grad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="var(--chart-1)" stopOpacity={1} />
+                  <stop offset="100%" stopColor="var(--chart-1)" stopOpacity={0.55} />
+                </linearGradient>
+                <linearGradient id="khata-expense-grad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="var(--chart-3)" stopOpacity={1} />
+                  <stop offset="100%" stopColor="var(--chart-3)" stopOpacity={0.55} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid stroke="var(--border)" strokeDasharray="3 6" vertical={false} />
               <XAxis
                 dataKey="label"
                 stroke="var(--muted-foreground)"
@@ -70,9 +86,9 @@ export function MultiPeriodChart({ title, buckets, granularity }: Props) {
                 formatter={(v: any) => fmtINR(Number(v))}
                 cursor={{ fill: "var(--accent)", opacity: 0.4 }}
               />
-              <Legend wrapperStyle={{ fontSize: 12 }} />
-              <Bar dataKey="income" name="Income" fill="var(--chart-1)" radius={[4, 4, 0, 0]} maxBarSize={28} />
-              <Bar dataKey="expense" name="Expense" fill="var(--chart-3)" radius={[4, 4, 0, 0]} maxBarSize={28} />
+              <Legend wrapperStyle={{ fontSize: 12 }} iconType="circle" iconSize={8} />
+              <Bar dataKey="income" name="Income" fill="url(#khata-income-grad)" radius={[6, 6, 0, 0]} maxBarSize={26} animationDuration={650} />
+              <Bar dataKey="expense" name="Expense" fill="url(#khata-expense-grad)" radius={[6, 6, 0, 0]} maxBarSize={26} animationDuration={650} />
             </BarChart>
           </ResponsiveContainer>
         )}

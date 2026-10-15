@@ -104,7 +104,7 @@ export async function getSessionUser(token: string | undefined, type: SessionTyp
 
   if (type === "admin") {
     // Admin is env-authenticated; userId stored as "admin"
-    return { id: "admin", username: "admin", isActive: true, prefs: "{}" };
+    return { id: "admin", email: "admin@khata.internal", username: "admin", isActive: true, prefs: "{}" };
   }
 
   const user = await db.user.findUnique({ where: { id: session.userId } });

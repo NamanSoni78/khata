@@ -10,20 +10,12 @@ export default async function SettingsPage() {
   if (!user || user.id === "admin") {
     return <DashboardLogin />;
   }
-  const creds = await db.userWebAuthnCredential.findMany({
-    where: { userId: user.id },
-    select: { id: true, credentialId: true, deviceType: true, createdAt: true },
-    orderBy: { createdAt: "desc" },
-  });
+  const mpin = await db.userMpin.findUnique({ where: { userId: user.id } });
   return (
     <SettingsApp
       username={user.username}
-      passkeys={creds.map((c) => ({
-        id: c.id,
-        deviceType: c.deviceType ?? "Unknown device",
-        createdAt: c.createdAt.toISOString(),
-        credentialIdShort: c.credentialId.slice(0, 12) + "...",
-      }))}
+      email={user.email}
+      hasDashboardMpin={!!mpin?.dashboardMpinHash}
     />
   );
 }

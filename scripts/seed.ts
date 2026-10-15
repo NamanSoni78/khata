@@ -271,7 +271,7 @@ const DEFAULT_GLOSSARY = [
 //  SEED FUNCTION
 // ============================================================
 
-async function seed() {
+export async function seed() {
   console.log("Seeding AdminConfig defaults...");
 
   const configs: Array<[string, unknown]> = [
@@ -306,11 +306,15 @@ async function seed() {
   console.log("Seed complete.");
 }
 
-seed()
-  .catch((e) => {
-    console.error("Seed failed:", e);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await db.$disconnect();
-  });
+// Run directly (`bun run scripts/seed.ts`); imported as a module by
+// turso-setup.ts (import.meta.main is Bun's "executed directly" flag).
+if (import.meta.main) {
+  seed()
+    .catch((e) => {
+      console.error("Seed failed:", e);
+      process.exit(1);
+    })
+    .finally(async () => {
+      await db.$disconnect();
+    });
+}

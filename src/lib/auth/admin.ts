@@ -31,8 +31,10 @@ export async function createAdminSession() {
     update: {},
     create: {
       id: "admin",
+      email: "admin@khata.internal",
       username: "__admin__",
       passwordHash: "__env_managed__",
+      emailVerified: true,
       isActive: false, // not a regular login user
     },
   });

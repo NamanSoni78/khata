@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
-import { getDashboardAgentConfig } from "@/lib/admin-config";
+import { resolveDashboardAgentConfig } from "@/lib/user-config";
 import { runAgent } from "@/lib/agent/loop";
 import { DASHBOARD_TOOLS } from "@/lib/agent/tools-defs";
 
@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const config = await getDashboardAgentConfig();
+  const config = await resolveDashboardAgentConfig(user.id);
   if (!config.apiKey) {
     return NextResponse.json({
       error: "The assistant isn't set up yet. Please contact your administrator.",

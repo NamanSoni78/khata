@@ -2,11 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
 import {
-  getDailyAgentConfig,
-  getDashboardAgentConfig,
   getFeatureFlags,
   getUxConfig,
 } from "@/lib/admin-config";
+import { resolveDailyAgentConfig, resolveDashboardAgentConfig } from "@/lib/user-config";
 import { runAgent } from "@/lib/agent/loop";
 import { DAILY_TOOLS, DASHBOARD_TOOLS } from "@/lib/agent/tools-defs";
 import { db } from "@/lib/db";
@@ -93,7 +92,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
     userId = user.id;
-    config = await getDailyAgentConfig();
+    config = await resolveDailyAgentConfig(user.id); // admin defaults + user's own key overrides
     tools = DAILY_TOOLS;
     agentType = "daily";
   } else if (action === "dashboard") {
@@ -102,7 +101,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
     userId = user.id;
-    config = await getDashboardAgentConfig();
+    config = await resolveDashboardAgentConfig(user.id);
     tools = DASHBOARD_TOOLS;
     agentType = "dashboard";
   } else {

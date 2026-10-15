@@ -1,36 +1,34 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Plus_Jakarta_Sans } from "next/font/google";
 import "./globals.css";
-import { Toaster } from "@/components/ui/toaster";
 import { Toaster as SonnerToaster } from "sonner";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
+/* Brand/display face — bundled at build time (works offline in the PWA). */
+const jakarta = Plus_Jakarta_Sans({
+  subsets: ["latin", "latin-ext"],
+  weight: ["500", "600", "700", "800"],
+  display: "swap",
+  variable: "--font-jakarta",
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "https://khata.namansoni.in";
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL ?? "https://khata.namansoni.in"),
+  metadataBase: new URL(APP_URL),
   title: {
     default: "Khata — daily money tracker",
     template: "%s · Khata",
   },
   description:
-    "Log your daily transactions by chat or voice — in English, Hindi or Hinglish. Private, minimal, made for everyday use. Install it as an app and track expenses, accounts and investments effortlessly.",
+    "Log your daily transactions by chat or voice — in English, Hindi or Hinglish. Khata is a free, private, minimal expense tracker you install as an app. Track expenses, accounts, investments and reminders effortlessly.",
   applicationName: "Khata",
   keywords: [
     "money tracker", "expense tracker", "daily expenses", "personal finance",
     "hinglish", "voice expense logging", "khata", "digital ledger",
+    "expense manager india", "budget tracker", "khata app",
   ],
   manifest: "/manifest.json",
-  alternates: {
-    canonical: "/",
-  },
+  alternates: { canonical: "/" },
   openGraph: {
     type: "website",
     url: "/",
@@ -38,11 +36,13 @@ export const metadata: Metadata = {
     title: "Khata — daily money tracker",
     description:
       "Chat or speak your transactions in any mix of English or Hindi. Private, minimal, made for everyday use.",
+    images: [{ url: "/og.png", width: 1200, height: 630, alt: "Khata — daily money tracker" }],
   },
   twitter: {
-    card: "summary",
+    card: "summary_large_image",
     title: "Khata — daily money tracker",
     description: "Chat or speak your transactions. Private, minimal, everyday.",
+    images: ["/og.png"],
   },
   robots: {
     index: true,
@@ -71,8 +71,8 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = {
   themeColor: [
-    { media: "(prefers-color-scheme: light)", color: "#fafaf7" },
-    { media: "(prefers-color-scheme: dark)", color: "#26241f" },
+    { media: "(prefers-color-scheme: light)", color: "#008069" },
+    { media: "(prefers-color-scheme: dark)", color: "#0b141a" },
   ],
   width: "device-width",
   initialScale: 1,
@@ -81,46 +81,45 @@ export const viewport: Viewport = {
   viewportFit: "cover",
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+// Apply saved theme before first paint (no FOUC).
+const themeInit = `(function(){try{var t=localStorage.getItem('khata-theme');if(t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches)){document.documentElement.classList.add('dark')}}catch(e){}})();`;
+
+// Structured data for search engines.
+const jsonLd = {
+  "@context": "https://schema.org",
+  "@type": "WebApplication",
+  name: "Khata",
+  url: APP_URL,
+  applicationCategory: "FinanceApplication",
+  operatingSystem: "Web",
+  description:
+    "Daily money tracker you can chat with. Log expenses by voice or text in English, Hindi or Hinglish, track accounts and investments, set reminders and see where your money goes.",
+  offers: { "@type": "Offer", price: "0", priceCurrency: "INR" },
+};
+
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning className={jakarta.variable}>
       <head>
-        {/* Apply saved theme before first paint to avoid a flash */}
+        <script dangerouslySetInnerHTML={{ __html: themeInit }} />
         <script
-          dangerouslySetInnerHTML={{
-            __html: `
-              (function() {
-                try {
-                  var t = localStorage.getItem("khata-theme");
-                  var dark = t === "dark" || (!t && window.matchMedia("(prefers-color-scheme: dark)").matches);
-                  if (dark) document.documentElement.classList.add("dark");
-                } catch (e) {}
-              })();
-            `,
-          }}
+          type="application/ld+json"
+          dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
         />
       </head>
-      <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
-      >
+      <body className="font-sans">
         {children}
-        <Toaster />
-        <SonnerToaster position="top-center" richColors />
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `
-              if ('serviceWorker' in navigator) {
-                window.addEventListener('load', function() {
-                  navigator.serviceWorker.register('/sw.js').catch(function(err) {
-                    console.error('SW registration failed:', err);
-                  });
-                });
-              }
-            `,
+        <SonnerToaster
+          position="top-center"
+          toastOptions={{
+            style: {
+              borderRadius: "14px",
+              background: "var(--card)",
+              color: "var(--card-foreground)",
+              border: "1px solid var(--border)",
+              boxShadow: "var(--shadow-4)",
+              fontSize: "13.5px",
+            },
           }}
         />
       </body>

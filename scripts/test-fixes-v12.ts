@@ -21,6 +21,7 @@
 import { normalizeAppUrl, originFromRequest, appBaseUrl } from "../src/lib/app-url";
 import { rebuildHistoryMessages } from "../src/lib/agent/loop";
 import { createQStashScheduleForReminder } from "../src/lib/scheduler";
+import { cronUrlAuthKey } from "../src/lib/qstash-auth";
 
 let pass = 0;
 let fail = 0;
@@ -168,10 +169,12 @@ console.log("\n--- QStash destination (mocked API) ---");
       "https://khata.namansoni.in" // what originFromRequest() would pass
     );
     // V1.5 wire format: the destination rides RAW in the request path.
+    // V1.6: the destination now also carries the fire-auth HMAC (&k=).
+    const k_r_v12 = await cronUrlAuthKey("r_v12", "t_v12");
     eq(
       "request-derived destination used despite garbage env",
       captured[0]?.url,
-      "https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=r_v12"
+      `https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=r_v12&k=${k_r_v12}`
     );
     check("schedule created with request-derived destination", !!created?.scheduleId);
 
@@ -199,10 +202,11 @@ console.log("\n--- QStash destination (mocked API) ---");
     process.env.NEXT_PUBLIC_APP_URL = "khata.namansoni.in";
     captured.length = 0;
     await createQStashScheduleForReminder({ id: "r_v12c", type: "daily", time: "20:00" });
+    const k_r_v12c = await cronUrlAuthKey("r_v12c", "t_v12");
     eq(
       "scheme-less env normalized to https destination (raw in path)",
       captured[0]?.url,
-      "https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=r_v12c"
+      `https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=r_v12c&k=${k_r_v12c}`
     );
 
     // 4d. APP_URL runtime fallback used when no baseUrl passed.
@@ -210,10 +214,11 @@ console.log("\n--- QStash destination (mocked API) ---");
     process.env.APP_URL = "https://runtime-fallback.example.com";
     captured.length = 0;
     await createQStashScheduleForReminder({ id: "r_v12d", type: "daily", time: "09:10" });
+    const k_r_v12d = await cronUrlAuthKey("r_v12d", "t_v12");
     eq(
       "APP_URL runtime fallback wins over quoted NEXT_PUBLIC (raw in path)",
       captured[0]?.url,
-      "https://qstash.upstash.io/v2/schedules/https://runtime-fallback.example.com/api/notifications/cron?rid=r_v12d"
+      `https://qstash.upstash.io/v2/schedules/https://runtime-fallback.example.com/api/notifications/cron?rid=r_v12d&k=${k_r_v12d}`
     );
 
     // 4e. V1.5 whitespace guard: a baseUrl with stray internal whitespace
@@ -223,10 +228,11 @@ console.log("\n--- QStash destination (mocked API) ---");
       { id: "r_v12e", type: "daily", time: "20:00" },
       " https://khata.namansoni.in " // padded with spaces
     );
+    const k_r_v12e = await cronUrlAuthKey("r_v12e", "t_v12");
     eq(
       "whitespace-padded baseUrl trimmed (no spaces in destination)",
       captured[0]?.url,
-      "https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=r_v12e"
+      `https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=r_v12e&k=${k_r_v12e}`
     );
     check("destination contains no whitespace", !/\s/.test(String(captured[0]?.url ?? "")));
   } finally {

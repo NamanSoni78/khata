@@ -177,10 +177,15 @@ async function main() {
       const created = await createQStashScheduleForReminder({ id: "regression_r1", type: "daily", time: "20:00" });
       const call = captured[0];
       // The destination must be RAW in the request PATH (SDK wire format).
+      // V1.6: the destination also carries the fire-auth HMAC &k= (computed
+      // with the same mocked token the env provides) — assert it explicitly.
+      const { cronUrlAuthKey } = await import("../src/lib/qstash-auth");
+      const kR1 = await cronUrlAuthKey("regression_r1", "test_token_for_regression");
       const expectedUrl =
-        "https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=regression_r1";
+        `https://qstash.upstash.io/v2/schedules/https://khata.namansoni.in/api/notifications/cron?rid=regression_r1&k=${kR1}`;
       const okCreated = !!created && created.scheduleId === "sch_regression_1" && created.accountIndex === 0;
       const okWire = call?.method === "POST" && call?.url === expectedUrl;
+      const okKey = new RegExp(`[?&]k=${kR1}$`).test(String(call?.url ?? ""));
       const okCronHeader = call?.headers?.["upstash-cron"] === "30 14 * * *"; // 20:00 IST → 14:30 UTC
       const okAuth = call?.headers?.["authorization"] === "Bearer test_token_for_regression";
       const okRid = call?.body?.rid === "regression_r1";
@@ -188,6 +193,7 @@ async function main() {
       try { new URL(`https://x/` + (call?.url ?? "")); parseable = !!call?.url?.includes("https://khata.namansoni.in/"); } catch { parseable = false; }
       console.log(`${okCreated ? "✓" : "✗"} qstash: schedule created via REAL-format mocked API (got: ${JSON.stringify(created)})`);
       console.log(`${okWire ? "✓" : "✗"} qstash: WIRE FORMAT = POST /v2/schedules/<raw destination> (got: ${call?.method} ${call?.url})`);
+      console.log(`${okKey ? "✓" : "✗"} qstash: V1.6 fire-auth key &k= rides in the destination (got k=${/[?&]k=([0-9a-f]*)/.exec(String(call?.url ?? ""))?.[1]})`);
       console.log(`${okCronHeader ? "✓" : "✗"} qstash: Upstash-Cron header = "30 14 * * *" (got: ${call?.headers?.["upstash-cron"]})`);
       console.log(`${okAuth ? "✓" : "✗"} qstash: Bearer token header present`);
       console.log(`${okRid ? "✓" : "✗"} qstash: rid carried in delivered body`);
@@ -202,7 +208,7 @@ async function main() {
         !/\/v2\/schedules\/?$/.test(expectedUrl);
       console.log(`${bodyFormRejected ? "✓" : "✗"} qstash: JSON-body wire form is rejected by the real-API mock (the production 400)`);
 
-      if (!okCreated || !okWire || !okCronHeader || !okAuth || !okRid || !parseable || !bodyFormRejected) {
+      if (!okCreated || !okWire || !okKey || !okCronHeader || !okAuth || !okRid || !parseable || !bodyFormRejected) {
         throw new Error("QStash wire-format regression FAILED");
       }
     } finally {

@@ -9,7 +9,7 @@ import {
   TrendingUp, Download, LogOut, ArrowLeft, Users,
   RefreshCw, Bell, Plus, Trash2, FileText, Moon, Sun, Settings as SettingsIcon,
   Loader2, Upload, Copy, CalendarDays, MessageSquareText, CheckCheck,
-  MonitorSmartphone,
+  MonitorSmartphone, Stethoscope, CircleCheck, CircleAlert, CircleX, Minus,
 } from "lucide-react";
 import { MultiPeriodChart } from "@/components/dashboard/MultiPeriodChart";
 import DeepDiveChat from "@/components/dashboard/DeepDiveChat";
@@ -21,7 +21,13 @@ import {
   ensurePushEnabled,
   sendTestPush,
   describeTestResult,
+  waitForPushReceipt,
+  listenForPushReceipts,
+  getLastPushReceipt,
+  runPushDoctor,
+  resubscribeIfNeeded,
   type PushState,
+  type DoctorReport,
 } from "@/lib/push-client";
 
 const PIE_COLORS = [
@@ -715,20 +721,49 @@ function NotificationsCard() {
   // This device's push readiness — reminders only actually arrive on
   // devices that granted permission + subscribed.
   const [pushState, setPushState] = useState<PushState | null>(null);
+  // V1.6 — echo-verified test: did THIS browser actually receive the push?
+  const [echo, setEcho] = useState<
+    | { state: "waiting"; sentAt: number }
+    | { state: "received"; at: number; latencyMs: number }
+    | { state: "missed"; devices: string[] }
+    | null
+  >(null);
+  // V1.6 — notification doctor report + last receipt for THIS browser.
+  const [doctor, setDoctor] = useState<DoctorReport | null>(null);
+  const [doctorRunning, setDoctorRunning] = useState(false);
+  const [lastReceipt, setLastReceipt] = useState<{ at: number; title: string } | null>(null);
 
   const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
 
   // Register the service worker + read this device's real push state.
   // (sw.js registration was previously missing app-wide — which is why
   // enabling/testing notifications silently did nothing.)
+  // V1.6 boot sequence: silent subscription auto-heal (re-saves/resubscribes
+  // this device when the server lost it or the push keys changed), the
+  // persistent push-receipt indicator, and the in-page push fallback — every
+  // push that reaches this browser also toasts INSIDE the app, so an OS-level
+  // notification mute can no longer make reminders invisible while the app
+  // is open.
   useEffect(() => {
     registerServiceWorker();
     let active = true;
     (async () => {
+      await resubscribeIfNeeded();
       const s = await getPushState();
       if (active) setPushState(s);
+      const r = await getLastPushReceipt();
+      if (active && r?.at) setLastReceipt({ at: r.at, title: r.title });
     })();
-    return () => { active = false; };
+    const unsub = listenForPushReceipts((r) => {
+      setLastReceipt({ at: r.at, title: r.title });
+      if (r.title && !r.title.includes("Test")) {
+        toast(`🔔 ${r.title}${r.body ? ` — ${r.body}` : ""}`, { duration: 8000 });
+      }
+    });
+    return () => {
+      active = false;
+      unsub();
+    };
   }, []);
 
   /**
@@ -829,14 +864,57 @@ function NotificationsCard() {
 
   const sendTest = async () => {
     setTesting(true);
+    setEcho(null);
     try {
       const r = await sendTestPush();
       const d = describeTestResult(r);
       if (d.kind === "ok") toast.success(d.text);
       else if (d.kind === "warn") toast.warning(d.text, { duration: 6000 });
       else toast.error(d.text);
+
+      // V1.6 — verify on THIS device whether the push actually ARRIVED (the
+      // service worker echoes the moment the push event fires). This splits
+      // "didn't come" into its two real causes:
+      //   received-but-not-seen → OS/browser notification settings block it
+      //   (Focus Assist / DND / site notifications off) — the banner fix;
+      //   not-received-at-all   → the push went to a DIFFERENT browser
+      //   (device list above) or the browser wasn't running.
+      if (r.ok && r.sent > 0) {
+        setEcho({ state: "waiting", sentAt: r.sentAt ?? Date.now() });
+        const receipt = await waitForPushReceipt(15000);
+        if (receipt) {
+          setEcho({
+            state: "received",
+            at: receipt.at,
+            latencyMs: Math.max(0, receipt.at - (r.sentAt ?? receipt.at)),
+          });
+          toast.success(
+            `✓ Received by THIS browser in ${((receipt.at - (r.sentAt ?? receipt.at)) / 1000).toFixed(1)}s — if you didn't SEE a banner, it's blocked at the OS level (notification settings / Focus / DND), not in the app.`,
+            { duration: 9000 }
+          );
+        } else {
+          const labels = (r.devices ?? []).map((d2) => d2.label).join(", ") || "another browser";
+          setEcho({ state: "missed", devices: (r.devices ?? []).map((d2) => d2.label) });
+          toast.warning(
+            `This browser did NOT receive it — the push went to: ${labels}. Open Khata on that device to see it, or re-enable notifications here.`,
+            { duration: 9000 }
+          );
+        }
+      }
     } finally {
       setTesting(false);
+    }
+  };
+
+  const runDoctor = async () => {
+    setDoctorRunning(true);
+    try {
+      const report = await runPushDoctor();
+      setDoctor(report);
+      // The doctor may have healed the subscription server-side — refresh state.
+      setPushState(await getPushState());
+    } finally {
+      setDoctorRunning(false);
     }
   };
 
@@ -860,31 +938,117 @@ function NotificationsCard() {
         </p>
       </div>
       <div className="px-5 pb-5 space-y-3">
-        {/* This device's delivery status + test button */}
-        <div className="flex items-center justify-between gap-2 p-3 bg-muted/50 border border-border rounded-xl">
-          {pushState === null ? (
-            <span className="text-xs text-muted-foreground flex items-center gap-1.5">
-              <Loader2 className="w-3.5 h-3.5 animate-spin" /> Checking notifications on this device…
-            </span>
-          ) : !pushState.supported ? (
-            <span className="text-xs text-muted-foreground">This browser can&apos;t receive notifications.</span>
-          ) : pushState.subscribed && pushState.permission === "granted" ? (
-            <span className="text-xs text-emerald-600 dark:text-emerald-400 font-medium flex items-center gap-1.5">
-              <CheckCheck className="w-3.5 h-3.5" /> Enabled on this device
-            </span>
-          ) : pushState.permission === "denied" ? (
-            <span className="text-xs text-destructive font-medium">Blocked — unblock in browser site settings</span>
-          ) : (
-            <span className="text-xs text-muted-foreground">Not enabled on this device yet</span>
+        {/* This device's delivery status + test + doctor */}
+        <div className="p-3 bg-muted/50 border border-border rounded-xl space-y-2.5">
+          <div className="flex items-center justify-between gap-2">
+            {pushState === null ? (
+              <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Checking notifications on this device…
+              </span>
+            ) : !pushState.supported ? (
+              <span className="text-xs text-muted-foreground">This browser can&apos;t receive notifications.</span>
+            ) : pushState.subscribed && pushState.permission === "granted" ? (
+              <span className="text-xs text-emerald-600 dark:text-emerald-400 font-medium flex items-center gap-1.5">
+                <CheckCheck className="w-3.5 h-3.5" /> Enabled on this device
+              </span>
+            ) : pushState.permission === "denied" ? (
+              <span className="text-xs text-destructive font-medium">Blocked — unblock in browser site settings</span>
+            ) : (
+              <span className="text-xs text-muted-foreground">Not enabled on this device yet</span>
+            )}
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                onClick={runDoctor}
+                disabled={doctorRunning}
+                title="Run a full notification check on this device"
+                className="press h-7 px-2.5 rounded-lg border border-input text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors disabled:opacity-60 flex items-center gap-1.5"
+              >
+                {doctorRunning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Stethoscope className="w-3 h-3" />}
+                Check
+              </button>
+              <button
+                onClick={sendTest}
+                disabled={testing}
+                className="press h-7 px-2.5 rounded-lg border border-input text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors disabled:opacity-60 shrink-0 flex items-center gap-1.5"
+              >
+                {testing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Bell className="w-3 h-3" />}
+                Send test
+              </button>
+            </div>
+          </div>
+
+          {/* V1.6 — push receipt proof for THIS browser (persistent across
+              reloads — from the service worker's receipt log). */}
+          {lastReceipt && (
+            <p className="text-[11px] text-muted-foreground/80 flex items-center gap-1.5">
+              <CircleCheck className="w-3 h-3 text-emerald-500 shrink-0" />
+              Last push reached this browser at{" "}
+              {new Date(lastReceipt.at).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+              {lastReceipt.title ? ` — “${lastReceipt.title}”` : ""}
+            </p>
           )}
-          <button
-            onClick={sendTest}
-            disabled={testing}
-            className="press h-7 px-2.5 rounded-lg border border-input text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-accent/50 transition-colors disabled:opacity-60 shrink-0 flex items-center gap-1.5"
-          >
-            {testing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Bell className="w-3 h-3" />}
-            Send test
-          </button>
+
+          {/* V1.6 — echo status of the last Send test on THIS browser. */}
+          {echo?.state === "waiting" && (
+            <p className="text-[11px] text-muted-foreground flex items-center gap-1.5">
+              <Loader2 className="w-3 h-3 animate-spin" /> Waiting for this browser to receive the push…
+            </p>
+          )}
+          {echo?.state === "received" && (
+            <p className="text-[11px] text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
+              <CircleCheck className="w-3 h-3 shrink-0" />
+              Push received by this browser in {(echo.latencyMs / 1000).toFixed(1)}s. Didn&apos;t see a banner? It&apos;s blocked at the OS level (notification settings / Focus / DND) — not in the app.
+            </p>
+          )}
+          {echo?.state === "missed" && (
+            <p className="text-[11px] text-amber-600 dark:text-amber-400 flex items-center gap-1.5">
+              <CircleAlert className="w-3 h-3 shrink-0" />
+              This browser did NOT receive it{echo.devices.length ? ` — it went to ${echo.devices.join(", ")}` : ""}. Open Khata on that device, or re-enable notifications here.
+            </p>
+          )}
+
+          {/* V1.6 — the notification doctor: a live per-device checklist that
+              names the EXACT broken link and its fix, instead of shrugging. */}
+          {doctor && (
+            <div className="pt-1 space-y-1.5">
+              <p
+                className={`text-xs font-medium ${
+                  doctor.verdict === "healthy"
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : doctor.verdict === "needs-attention"
+                      ? "text-amber-600 dark:text-amber-400"
+                      : "text-destructive"
+                }`}
+              >
+                {doctor.summary}
+              </p>
+              {doctor.checks.map((c) => {
+                const Icon =
+                  c.status === "ok" ? CircleCheck :
+                  c.status === "fail" ? CircleX :
+                  c.status === "warn" ? CircleAlert :
+                  c.status === "info" ? Bell : Minus;
+                const color =
+                  c.status === "ok" ? "text-emerald-500" :
+                  c.status === "fail" ? "text-destructive" :
+                  c.status === "warn" ? "text-amber-500" :
+                  "text-muted-foreground";
+                return (
+                  <div key={c.id} className="text-[11px] leading-relaxed">
+                    <span className={`flex items-center gap-1.5 font-medium ${color}`}>
+                      <Icon className="w-3 h-3 shrink-0" /> {c.label}
+                    </span>
+                    <span className="text-muted-foreground block ml-[18px]">{c.detail}</span>
+                    {c.fix && (
+                      <span className="text-foreground/80 block ml-[18px] mt-0.5">
+                        <span className="font-medium">Fix:</span> {c.fix}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* V1.5: where notifications actually go — every subscribed device,

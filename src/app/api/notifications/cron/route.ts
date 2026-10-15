@@ -3,7 +3,10 @@ import { db } from "@/lib/db";
 import { sendPushToUser, resolveMessageTemplate, isWebPushConfigured } from "@/lib/notifications/push";
 import { computeNextRun, repairMissingQStashSchedules } from "@/lib/scheduler";
 import { allTokens, allSigningKeys } from "@/lib/qstash-pool";
+import { verifyCronUrlKey } from "@/lib/qstash-auth";
 import { originFromRequest } from "@/lib/app-url";
+import { getSessionUser } from "@/lib/auth/session";
+import { getSessionToken } from "@/lib/auth/cookies";
 // Self-start the in-process scheduler the first time this module loads on
 // any warm instance. It's idempotent and unref'd, so it never blocks shutdown.
 import { startInProcessScheduler } from "@/lib/notifications/scheduler";
@@ -28,18 +31,42 @@ startInProcessScheduler();
  * delivers. Any one of them is enough; if QStash's router ever mangles the
  * query string, delivery still targets the right reminder.
  *
+ * V1.6 — THE fix for "schedule created but notification never came":
+ * QStash fire requests carry NO bearer token — only an Upstash-Signature
+ * header. When signing-key env vars aren't set (the common single-env-var
+ * QSTASH_TOKEN setup), every scheduled fire was 401-rejected HERE: schedules
+ * fired on time at Upstash and bounced off our own door. Fire requests now
+ * also authenticate via the `&k=<hmac>` credential embedded in the schedule's
+ * destination URL when it was minted (scheduler.ts + qstash-auth.ts) — no
+ * extra env vars needed. The app's own browser poll authenticates with the
+ * user's session instead of the old spoofable X-Internal-Scheduler header
+ * (that header's value was public "1" — anyone could trigger the catch-all
+ * poll with it; the old comment claiming only our server could send it was
+ * simply wrong, since the daily app's browser poll sent exactly that header).
+ *
  * AUTH — request must pass ONE of:
  *  - Upstash server signature (JWT HS256 with QSTASH_CURRENT_SIGNING_KEY or
  *    QSTASH_NEXT_SIGNING_KEY) in the `Upstash-Signature` header
- *  - Bearer token matching QSTASH_TOKEN
- *  - Internal scheduler header `X-Internal-Scheduler: 1` (self-call only —
- *    the request originates from this same server process, so it can't be
- *    spoofed from outside without already being inside the deployment)
+ *  - Bearer token matching a pooled QSTASH_TOKEN
+ *  - V1.6 URL key: `&k=` matching HMAC-SHA256(rid, any pooled QSTASH_TOKEN)
+ *    (rid-addressed fire requests only — the credential IS rid-bound)
+ *  - V1.6 browser poll: `X-Client-Poll: 1` + a valid daily/dashboard user
+ *    session (catch-all polling only — the app's own open tab)
  *  - If NEITHER env var is set, the endpoint stays open (local dev).
  */
 export async function POST(req: NextRequest) {
   const auth = await verifyQStashRequest(req);
   if (!auth.ok) {
+    // Log WHY (and which methods were even available) — the silent 401 on
+    // every scheduled fire is what let this bug hide for three versions.
+    console.warn(
+      `[cron] auth rejected (${auth.reason ?? "unauthorized"}; ` +
+        `available: bearer=${allTokens().length > 0}, ` +
+        `signature=${allSigningKeys().length > 0}, url-key=${allTokens().length > 0}, ` +
+        `client-poll=session). ` +
+        `If this is a QStash fire, its schedule predates V1.6 — the repair pass ` +
+        `migrates it automatically (dashboard visit or next catch-all tick).`
+    );
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -79,6 +106,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, fired: 0, reason: "not due yet", nextRunAt: rem.nextRunAt });
     }
     const r = await fireReminder(rem, now);
+    // V1.6: the delivery outcome is now VISIBLE in server logs — "schedule
+    // fired but nothing happened" is diagnosable from the Vercel console.
+    console.log(
+      `[cron] reminder ${rid} fired → sent ${r.sent} device(s)` +
+        (r.failed > 0 ? `, ${r.failed} failed` : "")
+    );
     return NextResponse.json({ ok: true, fired: r.sent > 0 ? 1 : 0, ...r });
   }
 
@@ -92,6 +125,7 @@ export async function POST(req: NextRequest) {
   for (const rem of dueRows) {
     const r = await fireReminder(rem, now);
     if (r.sent > 0) fired++;
+    else console.warn(`[cron] poll: reminder ${rem.id} due but sent 0 devices (failed ${r.failed})`);
   }
 
   // Self-healing: re-register exact-time QStash delivery for reminders whose
@@ -148,11 +182,19 @@ async function fireReminder(
   now: Date
 ): Promise<{ sent: number; failed: number }> {
   const message = await resolveMessageTemplate(rem.userId, rem.message);
-  const result = await sendPushToUser(rem.userId, {
-    title: rem.title || "Khata",
-    body: message,
-    url: "/",
-  });
+  // V1.6: reminders now travel with urgency "high" (wakes Doze/sleeping
+  // devices — a reminder is exactly the "time-sensitive" case the Urgency
+  // header exists for) and a 24h TTL: if the device is offline longer than
+  // that, delivering a day-old reminder is noise, so the service drops it.
+  const result = await sendPushToUser(
+    rem.userId,
+    {
+      title: rem.title || "Khata",
+      body: message,
+      url: "/",
+    },
+    { urgency: "high", ttl: 86400 }
+  );
 
   const isOneTime = rem.type === "once";
   await db.scheduledNotification.update({
@@ -180,16 +222,9 @@ async function verifyQStashRequest(req: NextRequest): Promise<{ ok: boolean; rea
   // No auth configured (local dev) — allow.
   if (tokens.length === 0 && signingKeys.length === 0) return { ok: true };
 
-  // 0. Internal self-trigger from the in-process scheduler. The header value
-  //    isn't a secret (it's just "1") — but a request bearing it can only have
-  //    come from our own server process, which is the whole point. This lets the
-  //    scheduler POST to itself when QSTASH_TOKEN is set but we still want the
-  //    belt-and-suspenders poll to run.
-  if (req.headers.get("x-internal-scheduler") === "1") {
-    return { ok: true };
-  }
-
-  // 1. Bearer token check (any pooled account)
+  // 1. Bearer token check (any pooled account). The in-process scheduler's
+  //    self-fetch carries this whenever QStash is configured. NOTE: QStash's
+  //    own fire requests do NOT — see checks 2 and 3.
   if (tokens.length > 0) {
     const authHeader = req.headers.get("authorization");
     const bearer = authHeader?.replace(/^Bearer\s+/i, "");
@@ -207,7 +242,33 @@ async function verifyQStashRequest(req: NextRequest): Promise<{ ok: boolean; rea
     }
   }
 
-  return { ok: false, reason: "unauthorized" };
+  // 3. V1.6 URL key — HMAC(rid, pooled token) embedded in the destination
+  //    URL when the schedule was minted. This is what authenticates QStash
+  //    fire POSTs on deployments that set QSTASH_TOKEN but no signing keys
+  //    (previously: 401 on EVERY scheduled fire → reminders never delivered
+  //    while tests kept working — the exact bug V1.6 exists to kill).
+  const url = new URL(req.url);
+  const ridParam = url.searchParams.get("rid");
+  const keyParam = url.searchParams.get("k");
+  if (ridParam && keyParam && /^[A-Za-z0-9_-]{1,64}$/.test(ridParam)) {
+    if (await verifyCronUrlKey(ridParam, keyParam, tokens)) return { ok: true };
+  }
+
+  // 4. V1.6 browser poll — the daily app's open tab pings the catch-all
+  //    every 60s with X-Client-Poll + the user's session cookie. Replaces the
+  //    old X-Internal-Scheduler header whose value ("1") was public and thus
+  //    spoofable by anyone. Only ever authorizes the CATCH-ALL (no rid) —
+  //    firing a specific reminder stays exclusive to QStash channels.
+  if (req.headers.get("x-client-poll") === "1" && !ridParam) {
+    let user = await getSessionUser(await getSessionToken("daily"), "daily");
+    if (!user || user.id === "admin") {
+      user = await getSessionUser(await getSessionToken("dashboard"), "dashboard");
+    }
+    if (user && user.id !== "admin") return { ok: true };
+    return { ok: false, reason: "client-poll without a valid session" };
+  }
+
+  return { ok: false, reason: "no bearer, no valid signature, no url key, no session" };
 }
 
 /** Verify an Upstash server-signature JWT (HS256) with Web Crypto. */

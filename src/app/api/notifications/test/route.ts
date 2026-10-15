@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSessionUser } from "@/lib/auth/session";
 import { getSessionToken } from "@/lib/auth/cookies";
-import { isWebPushConfigured, sendPushToUser, listDevices } from "@/lib/notifications/push";
+import { isWebPushConfigured, sendPushToUser, listDevices, getVapidPublicKey } from "@/lib/notifications/push";
 
 /**
  * POST /api/notifications/test
@@ -68,6 +68,12 @@ export async function POST(req: NextRequest) {
     // Which devices (browser + OS) were targeted — "Sent to 1 device" now
     // says WHICH device, exposing stale subscriptions instantly.
     devices: result.devices,
+    // V1.6: the server's CURRENT VAPID public key + send timestamp — the
+    // client compares the key against this browser's subscription (mismatch =
+    // subscription made under old keys → silent death → must re-enable) and
+    // measures push→receipt latency against sentAt for the receipt echo.
+    vapidPublicKey: getVapidPublicKey(),
+    sentAt: Date.now(),
   });
 }
 

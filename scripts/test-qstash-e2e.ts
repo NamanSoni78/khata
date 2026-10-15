@@ -1,53 +1,58 @@
 /**
- * END-TO-END PROOF of the V1.5 QStash fix — the user's EXACT production bug:
+ * END-TO-END PROOF of the QStash pipeline — V1.5 wire format + V1.6 fire auth.
  *
- *   [qstash] schedule create failed (acct 0): 400
- *   {"error":"invalid destination url: endpoint has invalid scheme, add http:// or https://"}
+ * V1.5 root cause (fixed): the schedule-create call POSTed a JSON body
+ * {destination, cron} to /v2/schedules. The REAL QStash API takes the
+ * destination URL RAW IN THE REQUEST PATH with the cron in the Upstash-Cron
+ * HEADER — the JSON-body form makes QStash see an EMPTY destination →
+ * "invalid scheme" 400.
  *
- * ROOT CAUSE (V1.5, finally found): the schedule-create call POSTed a JSON
- * body {destination, cron} to /v2/schedules. The REAL QStash API takes the
- * destination URL RAW IN THE REQUEST PATH (POST /v2/schedules/<destination>)
- * with the cron in the Upstash-Cron HEADER — verified against the official
- * @upstash/qstash SDK's Schedules.create() (path: ["v2","schedules",
- * request.destination]). The JSON-body form makes QStash see an EMPTY
- * destination → "invalid scheme" 400 — regardless of how valid the URL
- * itself is. That's why V1.1/V1.2's URL-content fixes didn't help.
+ * V1.6 root cause (fixed here): QStash fire requests arrive WITHOUT a bearer
+ * token (only an Upstash-Signature, which we can't verify without signing-key
+ * env vars). The cron route 401-rejected every scheduled fire — schedules
+ * fired on time at Upstash and bounced off our own door. Fixes proven here:
+ *   - schedule destinations now carry `&k=<HMAC(rid, token)>` (minted at
+ *     create time); a fire POST with a valid k and NO other auth → accepted;
+ *   - the spoofable X-Internal-Scheduler header (public value "1") no longer
+ *     authorizes anything → 401;
+ *   - the app's browser poll authorizes via X-Client-Poll + user session.
  *
- * Chain exercised over REAL HTTP against the REAL production server:
- *
- *   POST /api/dashboard/notifications with X-Forwarded-Host: khata.namansoni.in
- *     → createReminder(..., { baseUrl: originFromRequest(req) })
- *       → createQStashScheduleForReminder → fetch to qstash.upstash.io
- *         (intercepted by the preload hook → /tmp/qstash-captured.jsonl)
- *
- * The interceptor now behaves like the REAL QStash API — the V1.2 version
- * happily accepted the broken JSON-body form, which is exactly how an
- * "11/11 proof" passed while production kept 400ing. It now:
- *   - returns the EXACT production 400 for the body form (no destination in path)
- *   - demands the Upstash-Cron header on the path form
- *   - accepts only RAW (unencoded) destinations in the path
+ * The interceptor behaves like the REAL QStash API and additionally MEMORIES
+ * created schedules so GET /v2/schedules (the repair pass's reconciliation
+ * call) returns them — exercising the full V1.6 repair logic.
  *
  * Run: bun run scripts/test-qstash-e2e.ts
  *   (server must NOT be running — this script starts it with the intercept)
  */
 import { spawn, execSync } from "node:child_process";
+import { createHmac } from "node:crypto";
 import { writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import webpush from "web-push";
 
 const BASE = "http://localhost:3000";
 const CAPTURE = "/tmp/qstash-captured.jsonl";
 const INTERCEPT = "/tmp/qstash-intercept.cjs";
+const FAKE_TOKEN = "e2e_fake_token";
+
+/** V1.6 URL auth key as minted by the server: HMAC-SHA256(token, rid)[0..24] hex. */
+function urlKey(rid: string): string {
+  return createHmac("sha256", FAKE_TOKEN).update(rid).digest("hex").slice(0, 24);
+}
 
 // ---- 0. install the fetch interceptor (preloaded into the NODE server) ----
 // Behaves like the REAL QStash schedules/publish API:
 //   POST /v2/schedules            (JSON-body form) → 400 invalid destination
-//   POST /v2/schedules/<raw-url>  + Upstash-Cron   → 200 {scheduleId}
+//   POST /v2/schedules/<raw-url>  + Upstash-Cron   → 200 {scheduleId} (MEMOIZED)
+//   GET  /v2/schedules                              → 200 [{scheduleId, destination}]
 //   POST /v2/publish/<raw-url>                      → 200 {messageId}
 writeFileSync(INTERCEPT, `
 const origFetch = globalThis.fetch;
 const REAL_400 = JSON.stringify({ error: "invalid destination url: endpoint has invalid scheme, add http:// or https://" });
+const memoSchedules = new Map(); // scheduleId → destination (V1.6 repair-pass support)
 globalThis.fetch = async function (input, init) {
   const url = typeof input === "string" ? input : (input && input.url) || String(input);
   if (url && url.includes("qstash.upstash.io")) {
+    const method = (init && init.method) || "GET";
     const headers = {};
     try {
       const h = init && init.headers;
@@ -56,10 +61,16 @@ globalThis.fetch = async function (input, init) {
     } catch {}
     let body = "";
     try { body = String(init && init.body || ""); } catch {}
-    require("fs").appendFileSync(${JSON.stringify(CAPTURE)}, JSON.stringify({ url, method: (init && init.method) || "GET", headers, body }) + "\\n");
+    require("fs").appendFileSync(${JSON.stringify(CAPTURE)}, JSON.stringify({ url, method, headers, body }) + "\\n");
 
     // --- real-API behavior: schedules ---
     if (/\\/v2\\/schedules\\/?$/.test(url)) {
+      if (method === "GET") {
+        // V1.6 repair-pass reconciliation call: the real API lists the
+        // account's schedules with their destinations.
+        const list = Array.from(memoSchedules.entries()).map(([scheduleId, destination]) => ({ scheduleId, destination }));
+        return new Response(JSON.stringify(list), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
       // JSON-body wire form (the production bug) → the EXACT 400.
       return new Response(REAL_400, { status: 400, headers: { "Content-Type": "application/json" } });
     }
@@ -72,7 +83,9 @@ globalThis.fetch = async function (input, init) {
       if (!headers["upstash-cron"]) {
         return new Response(JSON.stringify({ error: "invalid cron expression" }), { status: 400, headers: { "Content-Type": "application/json" } });
       }
-      return new Response(JSON.stringify({ scheduleId: "sch_e2e_proof_" + Date.now() }), {
+      const scheduleId = "sch_e2e_proof_" + Date.now() + "_" + memoSchedules.size;
+      memoSchedules.set(scheduleId, dest);
+      return new Response(JSON.stringify({ scheduleId }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
@@ -109,7 +122,10 @@ execSync("bun run scripts/seed.ts", {
 
 // ---- 2. production server with the EXACT broken prod env + interceptor ----
 // NEXT_PUBLIC_APP_URL carries the user's original scheme-less value; QStash
-// token is set so the schedule-creation path actually runs.
+// token is set so the schedule-creation path actually runs. VAPID keys are
+// generated per-run so the cron route's full fire path (push delivery) runs
+// instead of early-returning "Web Push not configured".
+const vapid = webpush.generateVAPIDKeys();
 const server = spawn("node", ["node_modules/next/dist/bin/next", "start"], {
   cwd: "/home/z/my-project",
   env: {
@@ -118,7 +134,9 @@ const server = spawn("node", ["node_modules/next/dist/bin/next", "start"], {
     EMAIL_DEV_MODE: "true",
     ADMIN_USERNAME: "admin",
     ADMIN_PASSWORD: "admin123",
-    QSTASH_TOKEN: "e2e_fake_token",
+    QSTASH_TOKEN: FAKE_TOKEN,
+    NEXT_PUBLIC_VAPID_PUBLIC_KEY: vapid.publicKey,
+    VAPID_PRIVATE_KEY: vapid.privateKey,
     NEXT_PUBLIC_APP_URL: "khata.namansoni.in", // THE EXACT BROKEN PROD VALUE
     PORT: "3000",
     NODE_OPTIONS: `--require ${INTERCEPT}`,
@@ -241,8 +259,16 @@ try {
   );
   check(
     "Bearer authorization header present",
-    call?.headers?.["authorization"] === "Bearer e2e_fake_token",
+    call?.headers?.["authorization"] === `Bearer ${FAKE_TOKEN}`,
     `got: ${call?.headers?.["authorization"]}`
+  );
+  check(
+    "V1.6 URL auth key rides in the destination (&k=<24-hex HMAC of rid>)",
+    (() => {
+      const m2 = /[?&]k=([0-9a-f]+)$/.exec(String(call?.url ?? ""));
+      return !!m2 && m2[1] === urlKey(cr.json.id);
+    })(),
+    `expected k=${urlKey(cr.json.id)}, got: ${call?.url}`
   );
   check(
     "rid carried in delivered body",
@@ -298,8 +324,124 @@ try {
     `got: ${pubCalls[0]?.method} ${pubCalls[0]?.url}`
   );
 
+  // ---- 8. V1.6 FIRE AUTH — the exact production scenario: QStash's schedule
+  //         fires and POSTs the destination URL with NO bearer token and NO
+  //         signing-key signature (none configured — only QSTASH_TOKEN is set,
+  //         exactly like the user's deployment). Before V1.6: 401, reminder
+  //         never delivered. Now: the &k= HMAC minted into the URL at create
+  //         time authenticates the fire. ----
+  // A reminder due within the 10-minute early window: now + 5min (IST wall
+  // clock = UTC + 5:30, plus the 5-minute lead).
+  const istNow = new Date(Date.now() + 5.5 * 60 * 60 * 1000 + 5 * 60 * 1000);
+  const hh = String(istNow.getUTCHours()).padStart(2, "0");
+  const mm = String(istNow.getUTCMinutes()).padStart(2, "0");
+  const crFire = await jfetch(`${BASE}/api/dashboard/notifications`, {
+    method: "POST",
+    headers: fwdHeaders,
+    body: JSON.stringify({ type: "daily", time: `${hh}:${mm}`, message: "fire auth proof" }),
+  });
+  check("near-term reminder created for the fire test", crFire.status === 200, JSON.stringify(crFire.json));
+
+  const fireRid = crFire.json.id as string;
+  const fireUrl = `${BASE}/api/notifications/cron?rid=${fireRid}&k=${urlKey(fireRid)}`;
+
+  // 8a. THE proof: token-less QStash-style fire → accepted (was 401 pre-V1.6).
+  const fire1 = await jfetch(fireUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rid: fireRid }),
+  });
+  check(
+    "V1.6 FIRE: token-less POST with valid &k= → 200 (not 401!)",
+    fire1.status === 200 && fire1.json?.ok === true,
+    `got: ${fire1.status} ${JSON.stringify(fire1.json)}`
+  );
+
+  // 8b. The fire response reports delivery observably (sent/failed counts —
+  //     V1.6 logs + response fields make "fired but nothing happened"
+  //     diagnosable instead of silent). The rare midnight rollover edge makes
+  //     the reminder not-yet-due; a structured reason is equally observable.
+  check(
+    "fire response reports delivery counts (sent/failed) or a due-state reason",
+    typeof fire1.json?.sent === "number" || fire1.json?.reason === "not due yet",
+    JSON.stringify(fire1.json)
+  );
+
+  // 8c. Wrong key → rejected.
+  const badKey = "f".repeat(24);
+  const fire2 = await jfetch(`${BASE}/api/notifications/cron?rid=${fireRid}&k=${badKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  check("wrong &k= → 401", fire2.status === 401, `got: ${fire2.status}`);
+
+  // 8d. No credentials at all → 401.
+  const fire3 = await jfetch(`${BASE}/api/notifications/cron`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  check("no credentials → 401", fire3.status === 401, `got: ${fire3.status}`);
+
+  // 8e. THE SPOOF IS DEAD: the old X-Internal-Scheduler header (public value
+  //     "1", previously an auth bypass anyone could use) no longer authorizes.
+  const fire4 = await jfetch(`${BASE}/api/notifications/cron`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Internal-Scheduler": "1" },
+    body: "{}",
+  });
+  check("spoofed X-Internal-Scheduler → 401 (hole closed)", fire4.status === 401, `got: ${fire4.status}`);
+
+  // 8f. Browser poll without a session → 401.
+  const fire5 = await jfetch(`${BASE}/api/notifications/cron`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Client-Poll": "1" },
+    body: "{}",
+  });
+  check("X-Client-Poll without a session → 401", fire5.status === 401, `got: ${fire5.status}`);
+
+  // 8g. Browser poll WITH the dashboard session → 200 (the app's own
+  //     authenticated tab may run the catch-all poll).
+  const fire6 = await jfetch(`${BASE}/api/notifications/cron`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Client-Poll": "1", cookie: djar },
+    body: "{}",
+  });
+  check("X-Client-Poll with a valid session → 200", fire6.status === 200 && fire6.json?.ok === true, `got: ${fire6.status} ${JSON.stringify(fire6.json)}`);
+
+  // 8h. Bearer fire (the in-process scheduler's self-fetch form) → 200.
+  const fire7 = await jfetch(`${BASE}/api/notifications/cron`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${FAKE_TOKEN}` },
+    body: "{}",
+  });
+  check("bearer self-fetch (in-process scheduler) → 200", fire7.status === 200 && fire7.json?.ok === true, `got: ${fire7.status}`);
+
+  // 8i. The V1.6 repair pass ran during the catch-alls above — prove it saw
+  //     the memoized upstream schedules (GET /v2/schedules) and did NOT mass-
+  //     recreate them (no second create for the 20:00 reminder).
+  await new Promise((r) => setTimeout(r, 300));
+  const finalCaptured = existsSync(CAPTURE)
+    ? readFileSync(CAPTURE, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l))
+    : [];
+  const listCalls = finalCaptured.filter((c) => c.method === "GET" && /\/v2\/schedules\/?$/.test(c.url));
+  check("repair pass listed upstream schedules (GET /v2/schedules)", listCalls.length >= 1, `list calls: ${listCalls.length}`);
+  const schedCreates = finalCaptured.filter(
+    (c) => c.method === "POST" && /\/v2\/schedules\//.test(c.url) && String(c.url).includes(urlKeyFor(cr.json.id))
+  );
+  check(
+    "healthy (k-bearing) schedule NOT recreated by the repair pass",
+    schedCreates.length === 1,
+    `creates for the 20:00 reminder: ${schedCreates.length}`
+  );
+
+  function urlKeyFor(id: string) {
+    return urlKey(id);
+  }
+
   function expectDest(id: string) {
-    return `https://khata.namansoni.in/api/notifications/cron?rid=${id}`;
+    return `https://khata.namansoni.in/api/notifications/cron?rid=${id}&k=${urlKey(id)}`;
   }
 } finally {
   server.kill("SIGTERM");

@@ -342,6 +342,482 @@ export async function ensurePushEnabled(): Promise<PushEnableResult> {
 }
 
 /* ------------------------------------------------------------------ */
+/* V1.6 — Receipt echo, SW version probe, notification doctor, auto-heal */
+/* ------------------------------------------------------------------ */
+
+export interface PushReceipt {
+  at: number;
+  title: string;
+  body: string;
+  tag?: string | null;
+  swVersion?: string;
+}
+
+function parseReceiptData(data: any): PushReceipt | null {
+  if (!data || typeof data !== "object") return null;
+  if (data.type !== "PUSH_RECEIVED") return null;
+  return {
+    at: Number(data.at) || 0,
+    title: String(data.title ?? ""),
+    body: String(data.body ?? ""),
+    tag: data.tag ?? null,
+    swVersion: typeof data.swVersion === "string" ? data.swVersion : undefined,
+  };
+}
+
+/**
+ * Which service-worker version is ACTUALLY active in this browser right now
+ * (PONG reply to a PING postMessage). A tab that hasn't been reloaded since
+ * a deploy keeps running the OLD worker — "the fix didn't work" was often
+ * just "the fix isn't loaded yet". Returns null when no worker answers.
+ */
+export function pingServiceWorker(timeoutMs = 3000): Promise<{ ok: boolean; version?: string }> {
+  return new Promise((resolve) => {
+    if (typeof window === "undefined" || !("serviceWorker" in navigator)) {
+      resolve({ ok: false });
+      return;
+    }
+    let done = false;
+    const finish = (r: { ok: boolean; version?: string }) => {
+      if (done) return;
+      done = true;
+      navigator.serviceWorker.removeEventListener("message", onMsg);
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const onMsg = (ev: MessageEvent) => {
+      if (ev.data?.type === "PONG") finish({ ok: true, version: ev.data.version });
+    };
+    const timer = setTimeout(() => finish({ ok: false }), timeoutMs);
+    navigator.serviceWorker.addEventListener("message", onMsg);
+    // Ask BOTH the controlling worker (normal case) and the registration's
+    // active worker (first load, before the SW claims the page) to answer.
+    try { navigator.serviceWorker.controller?.postMessage({ type: "PING" }); } catch { /* not controlled yet */ }
+    navigator.serviceWorker.ready
+      .then((reg) => { try { reg.active?.postMessage({ type: "PING" }); } catch { /* no active worker */ } })
+      .catch(() => {});
+  });
+}
+
+/**
+ * Last push RECEIVED by this browser (read from the service worker's
+ * persistent receipt cache — survives reloads). Null when none ever arrived
+ * (or the cache is unavailable). This is the ground truth for "did the push
+ * even reach this device" — completely independent of OS notification
+ * settings, which is what makes the diagnosis airtight.
+ */
+export async function getLastPushReceipt(): Promise<PushReceipt | null> {
+  if (typeof window === "undefined" || !("caches" in window)) return null;
+  try {
+    const cache = await caches.open("khata-push-log");
+    const res = await cache.match("/__khata_push_receipt__");
+    if (!res) return null;
+    const j = await res.json().catch(() => null);
+    return parseReceiptData(j);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wait up to `ms` for THIS browser to receive a push (the SW echoes
+ * PUSH_RECEIVED the moment a push event fires). Resolves null on timeout.
+ * Used right after "Send test" to tell, on THIS device, whether the push
+ * arrived — separating "browser never got it" (different device / dead
+ * subscription) from "browser got it but the OS hid it" (notification
+ * settings / Focus / DND).
+ */
+export function waitForPushReceipt(ms = 15000): Promise<PushReceipt | null> {
+  return new Promise((resolve) => {
+    if (typeof window === "undefined" || !("serviceWorker" in navigator)) {
+      resolve(null);
+      return;
+    }
+    let done = false;
+    const finish = (r: PushReceipt | null) => {
+      if (done) return;
+      done = true;
+      navigator.serviceWorker.removeEventListener("message", onMsg);
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const onMsg = (ev: MessageEvent) => {
+      const r = parseReceiptData(ev.data);
+      if (r) finish(r);
+    };
+    const timer = setTimeout(() => finish(null), ms);
+    navigator.serviceWorker.addEventListener("message", onMsg);
+  });
+}
+
+/**
+ * Continuous push-receipt listener — the in-page notification fallback.
+ * While the app is open in this browser, every arriving push (test, reminder,
+ * anything) also surfaces INSIDE the page as a toast/banner, so even a
+ * device whose OS-level notifications are muted shows something visible.
+ * Returns an unsubscribe function.
+ */
+export function listenForPushReceipts(cb: (r: PushReceipt) => void): () => void {
+  if (typeof window === "undefined" || !("serviceWorker" in navigator)) return () => {};
+  const onMsg = (ev: MessageEvent) => {
+    const r = parseReceiptData(ev.data);
+    if (r) cb(r);
+  };
+  navigator.serviceWorker.addEventListener("message", onMsg);
+  return () => navigator.serviceWorker.removeEventListener("message", onMsg);
+}
+
+/* ------------------------------------------------------------------ */
+/* Notification doctor — a live, per-device checklist                     */
+/* ------------------------------------------------------------------ */
+
+export interface DoctorCheck {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "fail" | "skip" | "info";
+  detail: string;
+  /** Concrete fix when the check isn't ok. */
+  fix?: string;
+}
+
+export interface DoctorReport {
+  checks: DoctorCheck[];
+  verdict: "healthy" | "needs-attention" | "broken";
+  summary: string;
+}
+
+function platformLabel(): { browser: string; os: string; ios: boolean; standalone: boolean } {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  const browser =
+    /Edg\//i.test(ua) ? "Edge" :
+    /OPR\//i.test(ua) ? "Opera" :
+    /Firefox\//i.test(ua) ? "Firefox" :
+    /Chrome\//i.test(ua) ? "Chrome" :
+    /Safari\//i.test(ua) ? "Safari" : "this browser";
+  const os =
+    /Android/i.test(ua) ? "Android" :
+    /iPhone|iPad|iPod/i.test(ua) ? "iOS" :
+    /Windows/i.test(ua) ? "Windows" :
+    /Mac OS X|Macintosh/i.test(ua) ? "macOS" :
+    /Linux/i.test(ua) ? "Linux" : "this device";
+  const standalone =
+    (window.matchMedia?.("(display-mode: standalone)")?.matches ?? false) ||
+    (navigator as any).standalone === true;
+  return { browser, os, ios: os === "iOS", standalone };
+}
+
+function endpointProvider(endpoint: string): string {
+  if (/fcm\.googleapis\.com/i.test(endpoint)) return "Chrome/Android push service (FCM)";
+  if (/updates\.push\.services\.mozilla\.com/i.test(endpoint)) return "Firefox push service";
+  if (/push\.apple\.com/i.test(endpoint)) return "Apple push service";
+  return endpoint.replace(/^https?:\/\//, "").split("/")[0];
+}
+
+function toBase64Url(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Run the full on-device notification check. Every check returns a concrete,
+ * user-actionable result — no more "it should work". Async-safe, never
+ * throws; safe to call from any click handler.
+ */
+export async function runPushDoctor(): Promise<DoctorReport> {
+  const checks: DoctorCheck[] = [];
+  const plat = platformLabel();
+
+  // 1. Capability
+  if (!pushSupported()) {
+    checks.push({
+      id: "support",
+      label: "Browser support",
+      status: "fail",
+      detail: "This browser doesn't support web push notifications.",
+      fix: plat.ios && !plat.standalone
+        ? "On iPhone/iPad, add Khata to your Home Screen first (Share → Add to Home Screen) — then notifications become available."
+        : "Use Chrome, Edge, Firefox, or Safari 16.4+ for notifications.",
+    });
+    return { checks, verdict: "broken", summary: "Notifications can't work in this browser." };
+  }
+  checks.push({ id: "support", label: "Browser support", status: "ok", detail: `${plat.browser} on ${plat.os} supports web push.` });
+
+  // 2. iOS install-state (the #1 iOS confusion — browser tab = no push)
+  if (plat.ios) {
+    if (plat.standalone) {
+      checks.push({
+        id: "ios-pwa",
+        label: "Installed as an app",
+        status: "ok",
+        detail: "Running as an installed Home Screen app — required for iOS notifications.",
+      });
+    } else {
+      checks.push({
+        id: "ios-pwa",
+        label: "Installed as an app",
+        status: "fail",
+        detail: "iOS only delivers web notifications to apps installed on the Home Screen — not to Safari tabs.",
+        fix: "Tap Share → “Add to Home Screen”, open Khata from the icon, then enable notifications there.",
+      });
+    }
+  }
+
+  // 3. Permission
+  const perm = currentPermission();
+  if (perm === "granted") {
+    checks.push({ id: "permission", label: "Permission", status: "ok", detail: "Notification permission is granted." });
+  } else if (perm === "denied") {
+    checks.push({
+      id: "permission",
+      label: "Permission",
+      status: "fail",
+      detail: "Notification permission is BLOCKED for this site.",
+      fix: "Tap the lock/tune icon next to the address bar → Notifications → Allow, then reload and enable again.",
+    });
+  } else {
+    checks.push({
+      id: "permission",
+      label: "Permission",
+      status: "warn",
+      detail: "Notification permission hasn't been granted yet.",
+      fix: "Tap “Enable notifications” to grant it.",
+    });
+  }
+
+  // 4. Service worker + version (stale-worker detection)
+  const swReg = (await navigator.serviceWorker?.getRegistration?.("/").catch(() => null)) ?? null;
+  if (!swReg) {
+    checks.push({
+      id: "sw",
+      label: "Service worker",
+      status: "fail",
+      detail: "The notification service worker isn't registered in this browser.",
+      fix: "Reload the page once, then tap Enable notifications.",
+    });
+  } else {
+    const pong = await pingServiceWorker();
+    if (pong.ok && pong.version) {
+      checks.push({
+        id: "sw",
+        label: "Service worker",
+        status: "ok",
+        detail: `Active and answering (version ${pong.version}).`,
+      });
+    } else {
+      checks.push({
+        id: "sw",
+        label: "Service worker",
+        status: "warn",
+        detail: "Registered but not answering — likely an old version still controlling this tab.",
+        fix: "Close this tab fully and reopen Khata (or reload twice) so the new worker takes over.",
+      });
+    }
+  }
+
+  // 5. Local subscription
+  const reg = swReg ?? (await navigator.serviceWorker.ready.catch(() => null));
+  const sub = reg ? await reg.pushManager.getSubscription().catch(() => null) : null;
+  if (!sub) {
+    checks.push({
+      id: "subscription",
+      label: "This device's subscription",
+      status: perm === "granted" ? "warn" : "skip",
+      detail: perm === "granted"
+        ? "Permission is granted but this browser hasn't subscribed for push yet."
+        : "No push subscription (permission not granted yet).",
+      fix: perm === "granted" ? "Tap “Enable notifications” to subscribe this device." : undefined,
+    });
+  } else {
+    checks.push({
+      id: "subscription",
+      label: "This device's subscription",
+      status: "ok",
+      detail: `Subscribed via ${endpointProvider(sub.endpoint)}.`,
+    });
+  }
+
+  // 6. VAPID key match — subscription made under DIFFERENT server keys is
+  //    the classic silent killer after a redeploy with new keys.
+  let serverKey: string | null = null;
+  try {
+    const r = await fetch("/api/notifications/vapid-public-key");
+    const j = await r.json().catch(() => ({}));
+    serverKey = r.ok && typeof j.publicKey === "string" ? j.publicKey : null;
+  } catch { /* offline — skip */ }
+  if (serverKey && sub) {
+    let appKey: string | null = null;
+    try {
+      const opt = (sub as any).options?.applicationServerKey;
+      if (opt instanceof ArrayBuffer) appKey = toBase64Url(opt);
+      else if (typeof opt === "string") appKey = opt.replace(/=+$/, "");
+    } catch { /* not exposed in this browser */ }
+    if (appKey === null) {
+      checks.push({
+        id: "vapid",
+        label: "Server key match",
+        status: "skip",
+        detail: "This browser doesn't expose the subscription's server key — can't verify automatically.",
+      });
+    } else if (appKey === serverKey.replace(/=+$/, "")) {
+      checks.push({ id: "vapid", label: "Server key match", status: "ok", detail: "Subscription matches this deployment's push keys." });
+    } else {
+      checks.push({
+        id: "vapid",
+        label: "Server key match",
+        status: "fail",
+        detail: "This subscription was created under DIFFERENT push keys (keys changed on a redeploy). Pushes are accepted by the service but silently die at this browser.",
+        fix: "Tap “Enable notifications” once — it re-subscribes under the current keys.",
+      });
+    }
+  }
+
+  // 7. Server-side registration (ghost detection) + auto-heal chance
+  if (sub) {
+    try {
+      const r = await fetch("/api/notifications/test");
+      if (r.ok) {
+        const j = await r.json().catch(() => ({}));
+        const devices: any[] = Array.isArray(j.devices) ? j.devices : [];
+        const known = devices.some((d) => typeof d.endpointTail === "string" && sub.endpoint.endsWith(d.endpointTail));
+        if (known) {
+          checks.push({ id: "server", label: "Server knows this device", status: "ok", detail: `Saved on the server${devices.length > 1 ? ` (${devices.length} devices registered)` : ""}.` });
+        } else {
+          const healed = await resubscribeIfNeeded();
+          checks.push({
+            id: "server",
+            label: "Server knows this device",
+            status: healed ? "warn" : "fail",
+            detail: healed
+              ? "This browser's subscription wasn't saved server-side — it has been re-saved automatically now."
+              : "This browser's subscription is NOT saved on the server — pushes go to other devices only.",
+            fix: healed ? undefined : "Tap “Enable notifications” to re-save this device.",
+          });
+        }
+      }
+    } catch { /* offline — skip */ }
+  }
+
+  // 8. Last receipt — proof of actual delivery to THIS browser
+  const receipt = await getLastPushReceipt();
+  if (receipt?.at) {
+    const when = new Date(receipt.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    checks.push({
+      id: "receipt",
+      label: "Last push received",
+      status: "info",
+      detail: `A push reached this browser at ${when}${receipt.title ? ` — “${receipt.title}”` : ""}. If you didn't SEE it, the block is at the OS level (notification settings / Focus / DND), not in the app.`,
+      fix: plat.os === "Windows"
+        ? "Check Windows Settings → System → Notifications (Chrome must be allowed) and Focus Assist."
+        : plat.os === "Android"
+          ? "Check Android Settings → Apps → Chrome → Notifications, and that Do Not Disturb isn't hiding banners (they land in the shade — swipe down)."
+          : plat.os === "iOS"
+            ? "Check iOS Settings → Notifications → Khata (the Home Screen app) — banners and sounds must be on."
+            : plat.os === "macOS"
+              ? "Check macOS System Settings → Notifications → the browser — and Focus/Do Not Disturb."
+              : "Check the OS notification settings for this browser.",
+    });
+  } else if (sub) {
+    checks.push({
+      id: "receipt",
+      label: "Last push received",
+      status: "skip",
+      detail: "No push has arrived in this browser yet (nothing recorded). Send a test to create the first receipt.",
+    });
+  }
+
+  const hasFail = checks.some((c) => c.status === "fail");
+  const hasWarn = checks.some((c) => c.status === "warn");
+  const verdict = hasFail ? "broken" : hasWarn ? "needs-attention" : "healthy";
+  const failCount = checks.filter((c) => c.status === "fail").length;
+  const summary = hasFail
+    ? `${failCount} problem${failCount === 1 ? "" : "s"} found — see the fix steps above.`
+    : hasWarn
+      ? "Nearly there — a couple of things need attention."
+      : "Everything checks out — notifications are fully set up on this device.";
+  return { checks, verdict, summary };
+}
+
+/**
+ * Silent boot-time auto-heal for THIS device's push subscription:
+ *  - permission granted + no local subscription → subscribe + save;
+ *  - local subscription not saved server-side (DB reset, save failed) → re-save;
+ *  - subscription keys mismatch the server's current VAPID key → resubscribe
+ *    under the new key + save (the post-redeploy silent-death case).
+ * Never prompts (permission must already be granted), never throws, throttled
+ * to one attempt per page load.
+ */
+let _resubscribeAttempted = false;
+export async function resubscribeIfNeeded(): Promise<boolean> {
+  if (_resubscribeAttempted) return false;
+  _resubscribeAttempted = true;
+  if (!pushSupported() || currentPermission() !== "granted") return false;
+  try {
+    const reg = await navigator.serviceWorker.ready.catch(() => null);
+    if (!reg) return false;
+
+    let sub = await reg.pushManager.getSubscription().catch(() => null);
+
+    // Server's current VAPID key + saved devices.
+    let serverKey: string | null = null;
+    let savedTails: string[] = [];
+    try {
+      const kr = await fetch("/api/notifications/vapid-public-key");
+      const kj = await kr.json().catch(() => ({}));
+      serverKey = kr.ok && typeof kj.publicKey === "string" ? kj.publicKey : null;
+    } catch { /* offline — can't heal */ }
+    try {
+      const dr = await fetch("/api/notifications/test");
+      if (dr.ok) {
+        const dj = await dr.json().catch(() => ({}));
+        savedTails = (Array.isArray(dj.devices) ? dj.devices : [])
+          .map((d: any) => (typeof d.endpointTail === "string" ? d.endpointTail : ""))
+          .filter(Boolean);
+      }
+    } catch { /* offline — can't heal the ghost case */ }
+
+    // Key mismatch? → the old subscription is dead weight; drop it.
+    let keyMismatch = false;
+    if (sub && serverKey) {
+      try {
+        const opt = (sub as any).options?.applicationServerKey;
+        const appKey = opt instanceof ArrayBuffer ? toBase64Url(opt) : typeof opt === "string" ? opt.replace(/=+$/, "") : null;
+        if (appKey && appKey !== serverKey.replace(/=+$/, "")) keyMismatch = true;
+      } catch { /* not exposed — treat as unknown */ }
+    }
+
+    if (keyMismatch && sub) {
+      await sub.unsubscribe().catch(() => {});
+      sub = null;
+    }
+
+    const savedHere = !!sub && savedTails.some((tail) => sub!.endpoint.endsWith(tail));
+    if (sub && savedHere && !keyMismatch) return false; // healthy — nothing to do
+
+    // (Re)subscribe under the CURRENT server key.
+    if (!sub) {
+      if (!serverKey) return false;
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(serverKey) as unknown as BufferSource,
+      });
+    }
+
+    // Persist.
+    const res = await fetch("/api/notifications/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify(sub.toJSON()),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Test notification                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -354,6 +830,10 @@ export interface TestPushResult {
   httpError?: string;
   /** Devices (browser + OS) the test targeted — V1.5. */
   devices?: { id: string; label: string; endpointTail: string; subscribedAt: string | null }[];
+  /** The server's current VAPID public key — V1.6 (client-side key match). */
+  vapidPublicKey?: string;
+  /** Server clock at send — V1.6 (receipt latency measurement). */
+  sentAt?: number;
 }
 
 /** POST /api/notifications/test and report the TRUTH. */
@@ -374,6 +854,8 @@ export async function sendTestPush(message?: string): Promise<TestPushResult> {
       failed: Number(j.failed ?? 0),
       error: typeof j.error === "string" ? j.error : undefined,
       devices: Array.isArray(j.devices) ? j.devices : [],
+      vapidPublicKey: typeof j.vapidPublicKey === "string" ? j.vapidPublicKey : undefined,
+      sentAt: typeof j.sentAt === "number" ? j.sentAt : undefined,
     };
   } catch (e: any) {
     return { ok: false, sent: 0, failed: 0, httpError: e?.message ?? "network error" };

@@ -50,7 +50,7 @@ Import the repo, then set these env vars (Production **and** Preview):
 | `NEXT_PUBLIC_VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | from gen-vapid |
 | `VAPID_SUBJECT` | `mailto:you@example.com` |
 | `QSTASH_TOKEN` | token(s), **multiple allowed separated by `;`** |
-| `QSTASH_CURRENT_SIGNING_KEY` / `QSTASH_NEXT_SIGNING_KEY` | signing keys, same `;` order as tokens |
+| `QSTASH_CURRENT_SIGNING_KEY` / `QSTASH_NEXT_SIGNING_KEY` | signing keys, same `;` order as tokens — **optional since V1.6** (scheduled fires authenticate via the `&k=` URL key baked into every schedule destination; signing keys remain a recommended defense-in-depth) |
 
 **Multi-account QStash:** create 2–3 free Upstash accounts, put each account's token and keys
 in the same env var separated by `;` (order pairs them). Khata spreads recurring reminder
@@ -92,10 +92,10 @@ Also keep the Resend DKIM/SPF records in place.
 | Signup says "email isn't configured" | `RESEND_API_KEY` missing in Vercel env |
 | OTP mails in spam | complete Resend domain verification (DKIM/SPF) |
 | 500 on login/chat | `DATABASE_URL`/`DATABASE_AUTH_TOKEN` wrong → check Turso token |
-| Reminders don't fire | check `QSTASH_TOKEN` + the catch-all cron (step 6.5); V1.2+ also self-heals broken schedules on the next dashboard visit / cron tick |
+| Reminders don't fire | V1.6: fire requests self-authenticate via the `&k=` URL key — check Vercel logs for `[cron] reminder … fired → sent N device(s)`; `[cron] auth rejected` lines say exactly which credential was missing |
 | "The assistant isn't set up yet" | configure the daily agent in `/admin` |
 
-### Notifications checklist (V1.5)
+### Notifications checklist (V1.6)
 
 1. **Server log shows `[qstash] schedule create failed … invalid destination url`**
    → FIXED FOR REAL in V1.5. The two earlier fixes addressed the URL *content*;
@@ -103,36 +103,75 @@ Also keep the Resend DKIM/SPF records in place.
    `{destination, cron}` to `/v2/schedules`, but the real QStash API takes the
    destination URL **raw in the request path** (`POST /v2/schedules/<full-url>`)
    with the cron in the `Upstash-Cron` header (verified against the official
-   `@upstash/qstash` SDK's `Schedules.create()`). V1.5 sends the correct form,
+   `@upstash/qstash` SDK's `Schedules.create()`). V1.5+ sends the correct form,
    and a successful create now logs
-   `[qstash] schedule created (acct 0): schd… → https://khata.namansoni.in/api/notifications/cron?rid=… (cron "30 14 * * *")`
+   `[qstash] schedule created (acct 0): schd… → https://khata.namansoni.in/api/notifications/cron?rid=…&k=… (cron "30 14 * * *")`
    so you can SEE it working in Vercel logs.
-2. **"Sent to 1 device" but no notification appeared**
-   → two causes fixed in V1.5:
-   - Every notification shared the tag `khata-notif` with `renotify:false`, so
-     consecutive notifications **silently replaced** each other (notably on
-     Android). Tests now use a unique tag + `renotify:true` and stay on screen
-     until dismissed; reminders always alert fresh.
-   - The response now tells you **WHICH device** was targeted ("Chrome on
-     Windows · subscribed 2d ago") — a stale ghost subscription on a browser
-     you're not looking at is the other classic cause. The dashboard's
-     Reminders tab lists every subscribed device.
-   - If a test is "sent" but still invisible: check the OS notification center,
-     Windows **Focus Assist / Do Not Disturb**, and that the target browser is
-     actually running (push is only delivered while the browser runs).
-3. **"Enable notifications" / "Send test" did nothing**
+
+2. **"Schedule created successfully, but the notification never came"**
+   → THE V1.6 ROOT CAUSE, fixed. QStash fire requests arrive at
+   `/api/notifications/cron` with **no bearer token** — only an
+   `Upstash-Signature` header, which the route could only verify if
+   `QSTASH_CURRENT_SIGNING_KEY` / `QSTASH_NEXT_SIGNING_KEY` were set. With only
+   `QSTASH_TOKEN` configured (the common setup), **every scheduled fire was
+   401-rejected by our own endpoint** — schedules fired on time at Upstash and
+   bounced off our door, so the reminder never delivered. Test notifications
+   kept working because they never pass through the cron route — exactly the
+   "schedule created + test sent + nothing arrived" symptom.
+
+   V1.6 fixes this with **no new env vars**: every schedule destination URL now
+   carries `&k=<HMAC(rid, QSTASH_TOKEN)>` — a fire credential minted when the
+   schedule is created and verified on arrival. Existing pre-V1.6 schedules
+   (created without the key) are **migrated automatically** by the repair pass
+   — open the dashboard Reminders tab once after deploying (or wait for the
+   next catch-all tick) and watch Vercel logs for
+   `[qstash] migrating pre-V1.6 schedule …` followed by
+   `[qstash] schedule created …&k=…`. Setting the signing-key env vars is now
+   OPTIONAL (still recommended as defense-in-depth — the route accepts either
+   auth method).
+
+3. **"Sent to 1 device" but no notification appeared**
+   → V1.6 makes this **diagnosable on-device** instead of a guess:
+   - **Send test is now echo-verified**: right after sending, the app waits
+     15s for the service worker's receipt echo and tells you which of the two
+     real causes it was — *received-but-not-seen* (OS notification settings /
+     Focus Assist / DND — the app tells you the exact OS-specific fix) or
+     *not-received-at-all* (the push went to a different browser — the device
+     list says which).
+   - **Notification doctor**: dashboard → Reminders → **Check** runs a live
+     checklist on the device: browser support, iOS installed-app requirement,
+     permission, service-worker **version** (a stale worker from before the
+     deploy is detectable), this device's subscription, VAPID key match (the
+     post-redeploy silent killer), server-side registration, and the last push
+     receipt (proof the browser actually received one).
+   - **In-page fallback**: while the app is open, every push that reaches the
+     browser ALSO toasts inside the page — an OS-level mute can no longer make
+     reminders completely invisible.
+   - **Boot auto-heal**: on every load the app silently re-subscribes/re-saves
+     this device when the server lost the subscription or the push keys
+     changed (and the service worker handles `pushsubscriptionchange`
+     rotation on its own).
+   - Reminders now travel with `urgency: high` (wakes sleeping devices) and a
+     24h TTL.
+
+4. **"Enable notifications" / "Send test" did nothing**
    → fixed in V1.2 (the service worker was never registered before). After
    redeploying, reload the app once, then Settings → Enable notifications →
    Send test. The test now reports the TRUTH ("No device is subscribed…")
    instead of a fake "Sent!".
-4. **Permission prompt** fires automatically the moment you set any
+5. **Permission prompt** fires automatically the moment you set any
    notification (dashboard Schedule/Resume buttons, or "remind me at 8pm"
    in chat). If the browser already blocked notifications, unblock via the
    lock icon → Notifications → Allow, then reload.
-5. **Subscriptions are per-device**: enable on every device you want
+6. **Subscriptions are per-device**: enable on every device you want
    notifications on. The dashboard's reminders tab shows each device's
    status and has its own Send-test button.
-6. **QStash env hygiene (V1.5)**: tokens pasted with stray whitespace or
+7. **QStash env hygiene (V1.5)**: tokens pasted with stray whitespace or
    wrapped across lines are auto-cleaned; the destination URL is swept for
    whitespace before ever reaching QStash. Multiple accounts stay separated
    by `;` in `QSTASH_TOKEN`.
+8. **Security note (V1.6)**: the old `X-Internal-Scheduler: 1` header no
+   longer authorizes cron requests (its value was public — anyone could
+   trigger the catch-all poll with it). The app's own browser poll now
+   authenticates with the user's session; fire requests authenticate via the
+   URL key or the Upstash signature.

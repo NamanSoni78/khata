@@ -27,7 +27,10 @@ import {
   pickAccountForPublish,
   accountForIndex,
   primaryAccount,
+  allTokens,
+  getQStashAccounts,
 } from "@/lib/qstash-pool";
+import { cronUrlAuthKey } from "@/lib/qstash-auth";
 import { appBaseUrl, normalizeAppUrl, isLocalhostUrl } from "@/lib/app-url";
 
 const IST_OFFSET_MIN = 5 * 60 + 30; // IST = UTC + 5:30
@@ -242,6 +245,14 @@ export function isQStashConfigured(): boolean {
 /**
  * Absolute cron URL for a reminder (works on any host, incl. khata.namansoni.in).
  *
+ * V1.6: the URL carries `&k=<hmac(rid, token)>` — the fire-request
+ * credential. QStash delivers POST requests to this URL WITHOUT a bearer
+ * token; without the embedded key (or Upstash signing-key env vars), the
+ * cron route used to 401 every scheduled fire — schedules that fired into
+ * a wall. `authKey` is the HMAC for the account that will own the schedule
+ * (computed by the caller after account pick); when it's null (no QStash
+ * config / key derivation failed) the param is simply omitted.
+ *
  * `baseUrl` — when the caller runs inside a request, pass the REQUEST-DERIVED
  * origin (see originFromRequest()). It beats every env var because it is the
  * host the client demonstrably just reached us on; env values can be stale
@@ -252,24 +263,26 @@ export function isQStashConfigured(): boolean {
  * stripped or rejects the URL), or we return null and the caller skips QStash
  * instead of sending garbage.
  */
-function cronUrl(reminderId: string, baseUrl?: string): string | null {
+function cronUrl(reminderId: string, baseUrl?: string, authKey?: string | null): string | null {
   const base =
     (baseUrl ? normalizeAppUrl(baseUrl) : null) ?? appBaseUrl();
   // Whitespace guard: a pasted env var or forwarded host with stray spaces
   // must never reach QStash. normalizeAppUrl already trims/rejects most cases;
   // this is the belt-and-suspenders sweep over the FINAL assembled URL.
   const url =
-    `${base}/api/notifications/cron?rid=${encodeURIComponent(reminderId)}`
-      .replace(/[\s\u0000-\u001f\u007f]/g, "");
+    `${base}/api/notifications/cron?rid=${encodeURIComponent(reminderId)}` +
+      (authKey ? `&k=${authKey}` : "")
+    ;
+  const swept = url.replace(/[\s\u0000-\u001f\u007f]/g, "");
   try {
-    const u = new URL(url);
+    const u = new URL(swept);
     if (u.protocol !== "http:" && u.protocol !== "https:") return null;
     if (/\s/.test(u.href)) return null;
     // A loopback destination is useless to QStash (its servers can't reach
     // the user's machine) — dev/local relies on the in-process scheduler,
     // so skip schedule registration instead of registering dead weight.
-    if (isLocalhostUrl(url)) return null;
-    return url;
+    if (isLocalhostUrl(swept)) return null;
+    return swept;
   } catch {
     return null;
   }
@@ -300,7 +313,15 @@ export async function createQStashScheduleForReminder(
   const account = await pickAccountForNewSchedule();
   if (!account) return null;
 
-  const destination = cronUrl(reminder.id, baseUrl);
+  // V1.6: HMAC(rid, account token) rides in the URL so the scheduled fire
+  // POST (which carries NO bearer) authenticates at our cron route.
+  let authKey: string | null = null;
+  try {
+    authKey = await cronUrlAuthKey(reminder.id, account.token);
+  } catch {
+    authKey = null;
+  }
+  const destination = cronUrl(reminder.id, baseUrl, authKey);
   if (!destination) {
     // NEVER send a malformed destination to QStash — that's the exact 400
     // ("invalid destination url: endpoint has invalid scheme") this module
@@ -397,7 +418,15 @@ export async function publishOneTimeQStash(
   if (delaySec <= 0 || delaySec > 6 * 24 * 60 * 60) return false; // >6 days out: let poll handle later
   const account = pickAccountForPublish();
   if (!account) return false;
-  const destination = cronUrl(reminder.id, baseUrl);
+  // V1.6: same URL auth key as schedules — delayed publishes also arrive
+  // as token-less POSTs from QStash.
+  let authKey: string | null = null;
+  try {
+    authKey = await cronUrlAuthKey(reminder.id, account.token);
+  } catch {
+    authKey = null;
+  }
+  const destination = cronUrl(reminder.id, baseUrl, authKey);
   if (!destination) {
     console.error(
       `[qstash] skipping one-time publish: no valid destination ` +
@@ -546,10 +575,56 @@ let _lastRepairAt = 0;
 const REPAIR_THROTTLE_MS = 10 * 60 * 1000; // at most one pass per 10 min per instance
 
 /**
+ * List every schedule on one QStash account: scheduleId → destination URL.
+ * Used by the repair pass to see what ACTUALLY exists upstream (and whether
+ * it still authenticates). Handles both response shapes the API has used
+ * (bare array and `{ schedules: [...] }`). Returns ok=false on fetch/API
+ * failure so the caller can SKIP reconciliation instead of mistaking an
+ * empty result for "every schedule vanished" (which would mass-recreate).
+ */
+async function listSchedulesOnAccount(
+  token: string
+): Promise<{ ok: boolean; schedules: Map<string, string> }> {
+  const out = new Map<string, string>();
+  try {
+    const res = await fetch(`${QSTASH_BASE}/schedules`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return { ok: false, schedules: out };
+    const json = await res.json().catch(() => null);
+    const arr: any[] = Array.isArray(json)
+      ? json
+      : Array.isArray(json?.schedules)
+        ? json.schedules
+        : [];
+    for (const s of arr) {
+      if (typeof s?.scheduleId === "string" && typeof s?.destination === "string") {
+        out.set(s.scheduleId, s.destination);
+      }
+    }
+    return { ok: true, schedules: out };
+  } catch {
+    return { ok: false, schedules: out };
+  }
+}
+
+/**
  * Re-register exact-time QStash delivery for active reminders that are
  * missing it. Idempotent, throttled, never throws — safe to call from the
  * cron endpoint, the notifications API, or anywhere else opportunistically.
  * Returns how many reminders were repaired.
+ *
+ * V1.6 — the pass is now a full schedule RECONCILIATION:
+ *   1. recurring rows with no schedule id → create one (as before);
+ *   2. rows whose schedule no longer exists on ANY pooled account (deleted
+ *      upstream, token rotated) → create a replacement;
+ *   3. rows whose EXISTING schedule was created before V1.6 — its
+ *      destination URL lacks the `&k=` HMAC credential, so every fire was
+ *      401-rejected by our own cron route — → delete + recreate with the
+ *      authenticated URL. This migrates reminders created on V1.5
+ *      (the user's already-working `scd_…` schedules) without any manual
+ *      re-scheduling;
+ *   4. one-timers in the publish window without a publish → publish now.
  */
 export async function repairMissingQStashSchedules(
   force = false,
@@ -562,27 +637,70 @@ export async function repairMissingQStashSchedules(
 
   let repaired = 0;
   try {
-    // 1. Recurring reminders with no schedule → create one now.
-    const recurring = await db.scheduledNotification.findMany({
-      where: {
-        isActive: true,
-        qstashScheduleId: null,
-        type: { in: ["daily", "weekly", "monthly"] },
-      },
-      take: 25,
-    });
-    for (const row of recurring) {
-      const created = await createQStashScheduleForReminder(row, baseUrl);
-      if (created) {
-        await db.scheduledNotification.update({
-          where: { id: row.id },
-          data: { qstashScheduleId: created.scheduleId, qstashAccount: created.accountIndex },
-        });
-        repaired++;
+    // Upstream truth: scheduleId → destination, across every pooled account.
+    // listing.ok=false (API/network failure) disables the reconciliation
+    // checks that depend on upstream visibility — we then only repair rows
+    // with NO schedule id, exactly like the pre-V1.6 pass.
+    const accounts = getQStashAccounts();
+    const upstream = new Map<string, { destination: string; accountIndex: number }>();
+    let upstreamVisible = true;
+    for (const acct of accounts) {
+      const listing = await listSchedulesOnAccount(acct.token);
+      if (!listing.ok) {
+        upstreamVisible = false;
+        continue;
+      }
+      for (const [id, destination] of listing.schedules) {
+        upstream.set(id, { destination, accountIndex: acct.index });
       }
     }
 
-    // 2. One-timers still in the future (within QStash's 6-day publish
+    const recurring = await db.scheduledNotification.findMany({
+      where: {
+        isActive: true,
+        type: { in: ["daily", "weekly", "monthly"] },
+      },
+      take: 50,
+    });
+    for (const row of recurring) {
+      let needsRecreate = false;
+
+      if (!row.qstashScheduleId) {
+        // Case 1: never registered (e.g. created while every destination 400'd).
+        needsRecreate = true;
+      } else if (upstreamVisible) {
+        const live = upstream.get(row.qstashScheduleId);
+        if (!live) {
+          // Case 2: the schedule vanished upstream (deleted, wrong account,
+          // token rotated) — re-register so delivery resumes.
+          needsRecreate = true;
+        } else if (!/[?&]k=/.test(live.destination)) {
+          // Case 3: V1.5-era schedule — fires arrive with no credential our
+          // cron route accepts (no bearer on fire requests; signing keys may
+          // not be configured) → replace with the V1.6 authenticated URL.
+          needsRecreate = true;
+          await deleteQStashSchedule(row.qstashScheduleId, live.accountIndex);
+          console.log(
+            `[qstash] migrating pre-V1.6 schedule ${row.qstashScheduleId} (no URL auth key) for reminder ${row.id}`
+          );
+        }
+        // else: healthy — schedule exists AND authenticates.
+      }
+      // upstream not visible → can't reconcile safely; leave the row alone.
+
+      if (needsRecreate) {
+        const created = await createQStashScheduleForReminder(row, baseUrl);
+        if (created) {
+          await db.scheduledNotification.update({
+            where: { id: row.id },
+            data: { qstashScheduleId: created.scheduleId, qstashAccount: created.accountIndex },
+          });
+          repaired++;
+        }
+      }
+    }
+
+    // 4. One-timers still in the future (within QStash's 6-day publish
     //    window) whose delayed publish never went out → publish now.
     const onetimers = await db.scheduledNotification.findMany({
       where: {

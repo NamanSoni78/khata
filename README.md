@@ -71,7 +71,9 @@ Open http://localhost:3000 → sign up (dev mode shows the OTP on screen when no
      request headers, so notifications no longer depend on either.)
    - `RESEND_API_KEY` (+ optional `RESEND_FROM`)
    - VAPID keys (`bun run gen-vapid`) + `VAPID_SUBJECT`
-   - QStash token + signing keys (multi-account supported, `;`-separated)
+   - QStash token (multi-account supported, `;`-separated) — signing keys
+     optional since V1.6: scheduled fires self-authenticate via an HMAC key
+     baked into each schedule's callback URL
 4. Deploy, open `/admin`, configure the LLM agents (Groq/OpenAI/OpenRouter/Anthropic…),
    and you're live.
 

@@ -33,6 +33,9 @@ import {
   sendTestPush,
   describeTestResult,
   currentPermission,
+  waitForPushReceipt,
+  listenForPushReceipts,
+  resubscribeIfNeeded,
 } from "@/lib/push-client";
 
 type Stage = "auth" | "chat";
@@ -267,17 +270,36 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
      hung forever and no subscription could ever be created. Register it on
      every boot (idempotent), then reflect this device's real subscription
      state in the settings sheet (previously the button always showed
-     "Enable notifications" again after every reload). */
+     "Enable notifications" again after every reload).
+
+     V1.6 additions:
+     - resubscribeIfNeeded(): silent auto-heal — if permission is granted but
+       the server lost this browser's subscription (DB reset, failed save,
+       push keys rotated on a redeploy), it re-subscribes + re-saves without
+       any prompt. The classic "sent to 1 device but nothing anywhere" ghost.
+     - listenForPushReceipts(): the in-page notification fallback — every push
+       that reaches this browser also toasts INSIDE the chat while the app is
+       open, so an OS-level notification mute (Focus / DND / site notifs off)
+       can no longer make reminders completely invisible. */
   useEffect(() => {
     registerServiceWorker();
     let active = true;
     (async () => {
+      await resubscribeIfNeeded();
       const state = await getPushState();
       if (!active) return;
       setPushSubscribed(state.subscribed && state.permission === "granted");
       setPushPerm(state.permission);
     })();
-    return () => { active = false; };
+    const unsub = listenForPushReceipts((r) => {
+      if (r.title && !r.title.includes("Test")) {
+        toast(`🔔 ${r.title}${r.body ? ` — ${r.body}` : ""}`, { duration: 8000 });
+      }
+    });
+    return () => {
+      active = false;
+      unsub();
+    };
   }, []);
 
   /* ---------- load profile + history on mount ---------- */
@@ -408,14 +430,19 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
     }
   }, [online, historyLoaded, flushQueue]);
 
-  /* ---------- reminder self-poll ---------- */
+  /* ---------- reminder self-poll ----------
+     V1.6: sends X-Client-Poll (session-cookie-authenticated at the cron
+     route) instead of the old X-Internal-Scheduler header — that header's
+     value was public, so anyone could spoof the poll from outside. The
+     session cookie rides along automatically (same-origin fetch). */
   useEffect(() => {
     if (!online) return;
     const id = window.setInterval(() => {
       fetch("/api/notifications/cron", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-Internal-Scheduler": "1" },
+        headers: { "Content-Type": "application/json", "X-Client-Poll": "1" },
         body: "{}",
+        credentials: "same-origin",
       }).catch(() => {});
     }, 60_000);
     return () => window.clearInterval(id);
@@ -835,6 +862,26 @@ function ChatStage({ user, onLogout }: { user: { username: string; email: string
       if (d.kind === "ok") toast.success(d.text);
       else if (d.kind === "warn") toast.warning(d.text, { duration: 6000 });
       else toast.error(d.text);
+
+      // V1.6 — echo verification: did THIS browser receive the push? The
+      // service worker echoes the instant the push event fires; 15s of
+      // waiting splits "sent but invisible" into its two real causes and
+      // tells the user which one it is.
+      if (r.ok && r.sent > 0) {
+        const receipt = await waitForPushReceipt(15000);
+        if (receipt) {
+          toast.success(
+            `✓ Received by this browser in ${((receipt.at - (r.sentAt ?? receipt.at)) / 1000).toFixed(1)}s — if you didn't SEE a banner, it's blocked at the OS level (notification settings / Focus / DND), not in the app.`,
+            { duration: 9000 }
+          );
+        } else {
+          const labels = (r.devices ?? []).map((d2) => d2.label).join(", ") || "another browser";
+          toast.warning(
+            `This browser did NOT receive it — the push went to: ${labels}. Open Khata on that device, or re-enable notifications here.`,
+            { duration: 9000 }
+          );
+        }
+      }
     } finally {
       setPushLoading(false);
     }
